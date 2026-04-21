@@ -128,6 +128,431 @@ python scripts/generate_vllm_eval_tsubame_scripts.py \
     └── triton_utils/          # Triton kernel implementations
 ```
 
+## Paper Reproduction Configs
+
+The following commands reproduce the exact hyperparameters reported in the paper for each model and bit-width combination.
+
+### Stage 1: Block-wise QAT
+
+Common settings across all models:
+- Calibration samples: 4,096
+- Context length: 2,048
+- Calibration data: OpenThoughts-1.2M 80% + FineWeb-Edu 20% (`sweep_0.8`)
+- Group size: 128
+- Quantization parameter LR (scale, zero point): 1e-4
+
+#### Qwen3-1.7B W3
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_block_qat.py \
+    --model Qwen/Qwen3-1.7B \
+    --wbits 3 \
+    --group_size 128 \
+    --calib_dataset sweep_0.8 \
+    --train_size 4096 \
+    --val_size 64 \
+    --training_seqlen 2048 \
+    --epochs 2 \
+    --batch_size 2 \
+    --weight_lr 1e-5 \
+    --quant_lr 1e-4 \
+    --save_quant_dir ./output/block_qat/Qwen3-1.7B-w3g128 \
+    --output_dir ./log/block_qat/Qwen3-1.7B-w3g128
+```
+
+#### Qwen3-1.7B W2
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_block_qat.py \
+    --model Qwen/Qwen3-1.7B \
+    --wbits 2 \
+    --group_size 128 \
+    --calib_dataset sweep_0.8 \
+    --train_size 4096 \
+    --val_size 64 \
+    --training_seqlen 2048 \
+    --epochs 2 \
+    --batch_size 2 \
+    --weight_lr 2e-5 \
+    --quant_lr 1e-4 \
+    --save_quant_dir ./output/block_qat/Qwen3-1.7B-w2g128 \
+    --output_dir ./log/block_qat/Qwen3-1.7B-w2g128
+```
+
+#### Qwen3-4B W3
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_block_qat.py \
+    --model Qwen/Qwen3-4B \
+    --wbits 3 \
+    --group_size 128 \
+    --calib_dataset sweep_0.8 \
+    --train_size 4096 \
+    --val_size 64 \
+    --training_seqlen 2048 \
+    --epochs 2 \
+    --batch_size 2 \
+    --weight_lr 1e-5 \
+    --quant_lr 1e-4 \
+    --save_quant_dir ./output/block_qat/Qwen3-4B-w3g128 \
+    --output_dir ./log/block_qat/Qwen3-4B-w3g128
+```
+
+#### Qwen3-4B W2
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_block_qat.py \
+    --model Qwen/Qwen3-4B \
+    --wbits 2 \
+    --group_size 128 \
+    --calib_dataset sweep_0.8 \
+    --train_size 4096 \
+    --val_size 64 \
+    --training_seqlen 2048 \
+    --epochs 2 \
+    --batch_size 2 \
+    --weight_lr 2e-5 \
+    --quant_lr 1e-4 \
+    --save_quant_dir ./output/block_qat/Qwen3-4B-w2g128 \
+    --output_dir ./log/block_qat/Qwen3-4B-w2g128
+```
+
+#### Qwen3-8B W3
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_block_qat.py \
+    --model Qwen/Qwen3-8B \
+    --wbits 3 \
+    --group_size 128 \
+    --calib_dataset sweep_0.8 \
+    --train_size 4096 \
+    --val_size 64 \
+    --training_seqlen 2048 \
+    --epochs 2 \
+    --batch_size 2 \
+    --weight_lr 1e-5 \
+    --quant_lr 1e-4 \
+    --save_quant_dir ./output/block_qat/Qwen3-8B-w3g128 \
+    --output_dir ./log/block_qat/Qwen3-8B-w3g128
+```
+
+#### Qwen3-8B W2
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_block_qat.py \
+    --model Qwen/Qwen3-8B \
+    --wbits 2 \
+    --group_size 128 \
+    --calib_dataset sweep_0.8 \
+    --train_size 4096 \
+    --val_size 64 \
+    --training_seqlen 2048 \
+    --epochs 2 \
+    --batch_size 2 \
+    --weight_lr 2e-5 \
+    --quant_lr 1e-4 \
+    --save_quant_dir ./output/block_qat/Qwen3-8B-w2g128 \
+    --output_dir ./log/block_qat/Qwen3-8B-w2g128
+```
+
+### Stage 2: End-to-end Distillation
+
+Common settings across all models:
+- Training data: 32,768 samples from OpenThoughts-1.2M
+- Batch size: 64 (per_device_train_batch_size × gradient_accumulation_steps × num_gpus)
+- Optimizer: AdamW
+- LR scheduler: Cosine annealing decay
+- KL loss: Top-20 probability filtered (`--top_k 20`)
+- Cross-entropy weight α: 0.2 (`--cross_entropy_weight 0.2`)
+- KL divergence weight β: 1.0 (`--kl_weight 1.0`)
+- KD loss type: JSD (`--kd_loss_type jsd`)
+
+> **Note**: Adjust `--per_device_train_batch_size` and `--gradient_accumulation_steps` to achieve an effective batch size of 64 based on your GPU count and memory. The examples below assume 4 GPUs with `per_device_train_batch_size=1` and `gradient_accumulation_steps=16`.
+
+> **`--train_emb`**: When enabled, the embedding layer (`embed_tokens`) is also trained during distillation. Each config below provides both variants. Use `--train_emb` if you observe vocabulary-level degradation; omit it for the default (frozen embeddings).
+
+#### Qwen3-1.7B W3
+
+Without `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-1.7B-w3g128 \
+    --teacher_model Qwen/Qwen3-1.7B \
+    --wbits 3 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-1.7B-w3g128 \
+    --output_dir ./log/distill/Qwen3-1.7B-w3g128
+```
+
+With `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-1.7B-w3g128 \
+    --teacher_model Qwen/Qwen3-1.7B \
+    --wbits 3 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --train_emb \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-1.7B-w3g128-trainemb \
+    --output_dir ./log/distill/Qwen3-1.7B-w3g128-trainemb
+```
+
+#### Qwen3-1.7B W2
+
+Without `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-1.7B-w2g128 \
+    --teacher_model Qwen/Qwen3-1.7B \
+    --wbits 2 \
+    --group_size 128 \
+    --epochs 3 \
+    --learning_rate 5e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-1.7B-w2g128 \
+    --output_dir ./log/distill/Qwen3-1.7B-w2g128
+```
+
+With `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-1.7B-w2g128 \
+    --teacher_model Qwen/Qwen3-1.7B \
+    --wbits 2 \
+    --group_size 128 \
+    --epochs 3 \
+    --learning_rate 5e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --train_emb \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-1.7B-w2g128-trainemb \
+    --output_dir ./log/distill/Qwen3-1.7B-w2g128-trainemb
+```
+
+#### Qwen3-4B W3
+
+Without `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-4B-w3g128 \
+    --teacher_model Qwen/Qwen3-4B \
+    --wbits 3 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-4B-w3g128 \
+    --output_dir ./log/distill/Qwen3-4B-w3g128
+```
+
+With `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-4B-w3g128 \
+    --teacher_model Qwen/Qwen3-4B \
+    --wbits 3 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --train_emb \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-4B-w3g128-trainemb \
+    --output_dir ./log/distill/Qwen3-4B-w3g128-trainemb
+```
+
+#### Qwen3-4B W2
+
+Without `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-4B-w2g128 \
+    --teacher_model Qwen/Qwen3-4B \
+    --wbits 2 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-4 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-4B-w2g128 \
+    --output_dir ./log/distill/Qwen3-4B-w2g128
+```
+
+With `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-4B-w2g128 \
+    --teacher_model Qwen/Qwen3-4B \
+    --wbits 2 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-4 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --train_emb \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-4B-w2g128-trainemb \
+    --output_dir ./log/distill/Qwen3-4B-w2g128-trainemb
+```
+
+#### Qwen3-8B W3
+
+Without `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-8B-w3g128 \
+    --teacher_model Qwen/Qwen3-8B \
+    --wbits 3 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-8B-w3g128 \
+    --output_dir ./log/distill/Qwen3-8B-w3g128
+```
+
+With `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-8B-w3g128 \
+    --teacher_model Qwen/Qwen3-8B \
+    --wbits 3 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-6 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --train_emb \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-8B-w3g128-trainemb \
+    --output_dir ./log/distill/Qwen3-8B-w3g128-trainemb
+```
+
+#### Qwen3-8B W2
+
+Without `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-8B-w2g128 \
+    --teacher_model Qwen/Qwen3-8B \
+    --wbits 2 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-4 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-8B-w2g128 \
+    --output_dir ./log/distill/Qwen3-8B-w2g128
+```
+
+With `--train_emb`:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+    main_e2e_distill.py \
+    --model ./output/block_qat/Qwen3-8B-w2g128 \
+    --teacher_model Qwen/Qwen3-8B \
+    --wbits 2 \
+    --group_size 128 \
+    --epochs 1 \
+    --learning_rate 1e-4 \
+    --kl_weight 1.0 \
+    --cross_entropy_weight 0.2 \
+    --kd_loss_type jsd \
+    --top_k 20 \
+    --train_emb \
+    --dataset_type openthoughts \
+    --dataset_size 32768 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --save_quant_dir ./output/distill/Qwen3-8B-w2g128-trainemb \
+    --output_dir ./log/distill/Qwen3-8B-w2g128-trainemb
+```
+
 ## Citation
 
 If you find this work useful, please cite:
