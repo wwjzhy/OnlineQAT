@@ -30,6 +30,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from quantize.int_linear_fake import load_quantized_model
 from accelerate import infer_auto_device_map, dispatch_model
 from trl import GKDConfig, GKDTrainer
+from trl.models.utils import unwrap_model_for_generation
 from trl.trainer.utils import empty_cache
 from datasets import load_dataset
 import copy
@@ -109,7 +110,7 @@ def DFTCausalLMLoss(
     return loss
 
 class PolicyGKDTrainer(GKDTrainer):
-    def __init__(self, kl_weight=1.0, cross_entropy_weight=1.0, use_teacher_weight=False, use_dft_loss=False, top_k=None, kd_loss_type="jsd", mean_prob=0, beta=0.5, *args, **kwargs):
+    def __init__(self, kl_weight=1.0, cross_entropy_weight=1.0, use_teacher_weight=False, use_dft_loss=False, top_k=None, kd_loss_type="jsd", mean_prob=0, beta=0.5, opd_mode=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.kl_weight = kl_weight
         self.cross_entropy_weight = cross_entropy_weight
@@ -119,8 +120,45 @@ class PolicyGKDTrainer(GKDTrainer):
         self.kd_loss_type = kd_loss_type
         self.mean_prob = mean_prob
         self.beta = beta
+        self.opd_mode = opd_mode
         # Keep teacher model on GPU - do not move to CPU to avoid memory leaks
         # Teacher model device should be managed by device_map during initialization
+
+    @staticmethod
+    def forward_kl_loss(student_logits, teacher_logits, labels=None, temperature=1.0, top_k=None):
+        """Token-level forward KL(teacher || student), optionally on teacher top-k."""
+        student_logits = student_logits / temperature
+        teacher_logits = teacher_logits / temperature
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        with torch.no_grad():
+            teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        if top_k is not None and top_k > 0:
+            _, top_k_indices = torch.topk(teacher_log_probs, top_k, dim=-1)
+            student_log_probs = torch.gather(student_log_probs, -1, top_k_indices)
+            teacher_log_probs = torch.gather(teacher_log_probs, -1, top_k_indices)
+        kl = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True).sum(dim=-1)
+        if labels is not None:
+            mask = labels != -100
+            kl = kl[mask]
+            return kl.sum() / mask.sum().clamp(min=1)
+        return kl.mean()
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """OPD: always roll out the student, then JSD (CE optional). GKD keeps lmbda=0 offline path."""
+        if self.opd_mode:
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                    unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
+                )
+            prompt_len = inputs["prompts"].shape[1]
+            new_labels = new_labels.clone()
+            new_labels[:, :prompt_len] = -100
+            inputs = dict(inputs)
+            inputs["input_ids"] = new_input_ids
+            inputs["attention_mask"] = new_attention_mask
+            inputs["labels"] = new_labels
+            return super(GKDTrainer, self).training_step(model, inputs, num_items_in_batch)
+        return super().training_step(model, inputs, num_items_in_batch)
 
     @staticmethod
     def cakld_loss(student_logits, teacher_logits, labels=None, beta_prob=0.5):
@@ -232,10 +270,11 @@ class PolicyGKDTrainer(GKDTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # compute student output
+        need_ce = self.cross_entropy_weight > 0.0
         student_outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            labels=inputs["labels"] if not (self.use_teacher_weight or self.use_dft_loss) else None
+            labels=inputs["labels"] if need_ce and not (self.use_teacher_weight or self.use_dft_loss) else None
         )
 
         # compute teacher output in eval mode (BitDistiller style - no device movement)
@@ -265,7 +304,14 @@ class PolicyGKDTrainer(GKDTrainer):
 
         # KL divergence loss
         if self.kl_weight > 0.0:
-            if self.kd_loss_type == "cakld":
+            if self.kd_loss_type == "forward_kl":
+                kl_loss = self.forward_kl_loss(
+                    student_logits=shifted_student_logits,
+                    teacher_logits=shifted_teacher_logits,
+                    labels=shifted_labels,
+                    top_k=self.top_k,
+                )
+            elif self.kd_loss_type == "cakld":
                 # Convert mean_prob to beta_prob for cakld_loss
                 # mean_prob is the average max probability from teacher model
                 beta_prob = self.mean_prob.item() if torch.is_tensor(self.mean_prob) else self.mean_prob
@@ -309,7 +355,10 @@ class PolicyGKDTrainer(GKDTrainer):
         del shifted_teacher_logits
         del shifted_labels
 
-        loss = self.cross_entropy_weight * cross_entropy_loss + self.kl_weight * kl_loss
+        if need_ce:
+            loss = self.cross_entropy_weight * cross_entropy_loss + self.kl_weight * kl_loss
+        else:
+            loss = self.kl_weight * kl_loss
         # loss = cross_entropy_loss
 
         # Delete student_outputs if not returning them
@@ -582,7 +631,8 @@ def main():
     parser.add_argument("--top_k", type=int, default=None, help="Use top-k logits from teacher model for KL divergence computation (None means use all logits)")
     parser.add_argument("--train_emb", action="store_true", help="Enable training of embedding tokens (embed_tokens). Default is False.")
 
-    parser.add_argument("--kd_loss_type", type=str, default="jsd", choices=["jsd", "cakld"], help="Knowledge distillation loss type: 'jsd' for generalized_jsd_loss, 'cakld' for cakld_loss")
+    parser.add_argument("--kd_loss_type", type=str, default="jsd", choices=["jsd", "cakld", "forward_kl"], help="Knowledge distillation loss type: 'jsd' for generalized_jsd_loss, 'cakld' for cakld_loss, 'forward_kl' for OPD KL(teacher||student)")
+    parser.add_argument("--opd", action="store_true", help="On-policy distillation: student rollouts + forward KL. Same data/hparams as GKD; only the Stage-2 state source and KL form change.")
     parser.add_argument("--cakld_steps", type=int, default=100, help="Number of steps to calculate mean probability for CAKLD loss")
     parser.add_argument("--enable_efficient_qat", action="store_true", help="Enable efficient QAT mode: only train scale parameters, freeze all other parameters")
 
@@ -609,10 +659,14 @@ def main():
     logger.info(args)
 
     # Current AdamW settings with NaN prevention:
+    # GKD paper run: lmbda=0 offline JSD on dataset completions.
+    # OPD: lmbda=1 student rollouts; max_new_tokens matches max_length budget.
+    opd_gen_tokens = args.max_length if args.max_length else 8192
     training_args = GKDConfig(
         beta=1.0, # KL(student || teacher)
         num_train_epochs=args.epochs,
         max_length=args.max_length,
+        max_new_tokens=opd_gen_tokens if args.opd else 128,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,  # More optimal for AdamW fine-tuning
@@ -622,7 +676,7 @@ def main():
         output_dir=args.output_dir,
         gradient_checkpointing=True,
         seq_kd=False, # enforce supervised KD
-        lmbda=0.0, # enforce supervised KD
+        lmbda=1.0 if args.opd else 0.0,
         temperature=0.6,
         logging_steps=1,
         warmup_ratio=0.2,   # Added warmup to stabilize training
@@ -853,6 +907,7 @@ def main():
         top_k=args.top_k,
         kd_loss_type=args.kd_loss_type,
         mean_prob=mean_prob,
+        opd_mode=args.opd,
         model=model,
         teacher_model=teacher_model,
         processing_class=tokenizer,
@@ -861,6 +916,16 @@ def main():
         train_dataset=dataset,
         # optimizers=(optimizer, None),
     )
+    if args.opd:
+        # Cap prompt+rollout at the same sequence budget as GKD (collator max_length).
+        # Do not set max_new_tokens=8192: that would allow prompt_len + 8192 > GKD's 8192.
+        trainer.generation_config.max_new_tokens = None
+        trainer.generation_config.max_length = args.max_length or 8192
+        trainer.generation_config.use_cache = True
+        logger.info(
+            f"OPD enabled: student rollout lmbda=1 max_length={trainer.generation_config.max_length} "
+            f"kd_loss_type={args.kd_loss_type} top_k={args.top_k} ce_weight={args.cross_entropy_weight}"
+        )
 
     if trainer.is_world_process_zero():
         print(trainer.model)
