@@ -1,0 +1,22 @@
+# Pinned stack for CUDA 12.9 (cluster). Install with scripts/setup_env_cu129.sh
+# Do not pip install this file alone: torch must come from the cu129 wheel index.
+#
+# torch==2.8.0+cu129 is installed first from https://download.pytorch.org/whl/cu129
+# flash-attn is installed last, compiled against that torch.
+
+transformers==4.51.3
+trl==0.16.1
+datasets==3.2.0
+# README said accelerate<0.34, but trl 0.16.1 requires accelerate>=0.34.0
+accelerate==0.34.2
+numpy==1.26.4
+lm_eval==0.4.8
+tqdm==4.67.1
+termcolor==2.5.0
+sentencepiece==0.2.0
+protobuf==4.25.5
+psutil==6.1.1
+ninja==1.11.1.3
+packaging==24.2
+einops==0.8.1
+hf_transfer==0.1.9

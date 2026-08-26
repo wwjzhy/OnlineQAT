@@ -5,8 +5,7 @@ import torch
 import random
 from tqdm import tqdm
 import torch.nn as nn
-
-import torch
+import json
 from torch.utils.data import Dataset
 import os
 
@@ -112,13 +111,35 @@ def get_redpajama_concat(tokenizer, train_size, val_size, seed, seqlen, test_onl
 
     split_train_size = train_size
     split_val_size = val_size
-    # general data
-    general_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-    for i, sample in enumerate(general_dataset):
+    fineweb_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "raw", "fineweb_edu_subset.jsonl"
+    )
+
+    def _iter_fineweb_texts():
+        if os.path.isfile(fineweb_path):
+            print(f"get_redpajama_concat: local {fineweb_path}")
+            with open(fineweb_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    text = rec.get("text") or rec.get("content") or ""
+                    if text:
+                        yield text
+            return
+        print("get_redpajama_concat: streaming HuggingFaceFW/fineweb-edu sample-10BT")
+        general_dataset = load_dataset(
+            "HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True
+        )
+        for sample in general_dataset:
+            yield sample["text"]
+
+    for i, text in enumerate(_iter_fineweb_texts()):
         if len(localtrainloader) >= split_train_size and len(localvalloader) >= split_val_size:
             break
 
-        data_buffer += bos_token + sample['text'] + eos_token
+        data_buffer += bos_token + text + eos_token
         tokenized = tokenizer(data_buffer, return_tensors='pt')
         if tokenized.input_ids.shape[1] >= target_seqlen:
             inp = tokenized.input_ids[:, :target_seqlen]
