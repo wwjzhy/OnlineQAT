@@ -143,9 +143,48 @@ bash scripts/eval_paper_benchmarks.sh \
 
 ---
 
+## Exp #3（2026-08-26 新增）— Stage 1 block QAT 也跑同一套评测
+
+**要求：** Exp #1 的 Stage 1（`block_qat`）跑完后、**还没做 Stage 2 蒸馏**时，把该 checkpoint 转成 vLLM 格式，用公共约定那套 evalscope 评一遍。用来当 GKD（#1）和 OPD（#2）的蒸馏前基线。不要重训 Stage 1。
+
+`eval_paper_benchmarks.sh` 吃的是标准 HF 权重，不能直接评 `output/block_qat/...`（fake-quant 模块）。先 `convert_to_hf_vllm_compatible_model.py`，产出目录加 `-blockqat`，**不要覆盖** `#1` 最终的 `output/vllm/Qwen3-1.7B-w3g128`。
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w3g128`（Exp #1 `--stage 1`）。没有就先跑那个。
+
+**状态：** 未跑。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+test -f output/block_qat/Qwen3-1.7B-w3g128/config.json
+
+CUDA_VISIBLE_DEVICES="${CONVERT_GPU:-0}" python scripts/convert_to_hf_vllm_compatible_model.py \
+  --base-id ./output/block_qat/Qwen3-1.7B-w3g128 \
+  --save-dir ./output/vllm/Qwen3-1.7B-w3g128-blockqat \
+  --wbits 3 \
+  --group-size 128
+
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-1.7B-w3g128-blockqat \
+  ./output/eval/Qwen3-1.7B-w3g128-blockqat
+```
+
+和 `#1` / `#2` 的 eval 目录对比：
+
+```
+output/eval/Qwen3-1.7B-w3g128-blockqat   # 本实验：仅 Stage 1
+output/eval/Qwen3-1.7B-w3g128            # #1：Stage 1 + GKD
+output/eval/Qwen3-1.7B-w3g128-opd        # #2：Stage 1 + OPD
+```
+
+建议顺序：`#1 --stage 1` → **本实验评测** → `#1 --stage 2` 和 `#2`（可并行，都读同一份 Stage 1）。
+
+---
+
 ## 以后怎么加
 
-下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2` 的要求。
+下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。
 
 ```md
 ## Exp #N（YYYY-MM-DD 新增）— 一句话目标
