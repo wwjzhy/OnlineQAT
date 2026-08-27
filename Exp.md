@@ -7,7 +7,7 @@
 公共约定（各 Exp 除非自己改，否则都遵守）：
 
 - W3A16，不要 `--train-emb`，不要把 `--wbits` 改成 2
-- 评测：evalscope 一套，T=0.6，top_k=20，max_tokens=8192
+- 评测：evalscope 一套（`eval_paper_benchmarks.sh` 起 `vllm serve`，再走 openai_api），T=0.6，top_k=20，max_tokens=8192
   GSM8K、AIME24、AIME25、MATH-500、LiveCodeBench、MMLU-Redux、GPQA-Diamond、IFEval
 - 硬件：8 张同构 GPU（推荐 H20 96G）。A100 40G Stage 2 OOM 则该次命令加 `--max-length 4096`。不要混用 A100 和 H20
 - CUDA：`scripts/setup_env_cu129.sh`

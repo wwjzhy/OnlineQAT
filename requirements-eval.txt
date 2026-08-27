@@ -1,2 +1,4 @@
 evalscope[ifeval]>=0.16
 modelscope>=1.20
+vllm
+
