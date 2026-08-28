@@ -1,6 +1,7 @@
 import torch.nn.functional as F
 from quantize.quantizer import UniformAffineQuantizer
 import math
+from contextlib import contextmanager
 from logging import getLogger
 import importlib
 
@@ -65,6 +66,7 @@ class QuantLinear(nn.Module):
         # initialize quantizer dynamically
         self.weight_quantizer = self._create_quantizer(quantizer_class, wbits, group_size, org_module.weight, **quantizer_kwargs)
         self.use_temporary_parameter = False
+        self._cached_weight = None
         # self.output_scale = nn.Parameter([2.0], dtype=self.weight.dtype, device=self.weight.device)
 
     def _create_quantizer(self, quantizer_class, wbits, group_size, weight, **kwargs):
@@ -87,22 +89,64 @@ class QuantLinear(nn.Module):
 
     
     def forward(self, input: torch.Tensor):
-        if self.use_weight_quant:
-            if not torch.isfinite(self.weight).all():
-                print(f"weight is not finite: {self.weight.max().item()} {self.weight.min().item()} non finite {torch.sum(~torch.isfinite(self.weight))} / {self.weight.numel()}")
-
+        if self._cached_weight is not None:
+            weight = self._cached_weight
+            bias = self.bias
+        elif self.use_weight_quant:
             weight = self.weight_quantizer(self.weight)
             bias = self.bias
         else:
             weight = self.weight
             bias = self.bias
-        
-        out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
 
-        return out
+        return self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+
+    def cache_quantized_weight(self):
+        """Snapshot fake-quant weights. Valid while master weights are frozen (generate)."""
+        if self.use_weight_quant:
+            with torch.no_grad():
+                self._cached_weight = self.weight_quantizer(self.weight)
+        else:
+            self._cached_weight = None
+
+    def clear_quantized_weight_cache(self):
+        self._cached_weight = None
 
     def set_quant_state(self, weight_quant: bool = False):
         self.use_weight_quant = weight_quant
+        self.clear_quantized_weight_cache()
+
+
+@contextmanager
+def freeze_fake_quant_for_generate(model):
+    """Quantize each QuantLinear once for the generate loop, then drop the cache."""
+    modules = [m for m in model.modules() if isinstance(m, QuantLinear)]
+    for m in modules:
+        m.cache_quantized_weight()
+    try:
+        yield
+    finally:
+        for m in modules:
+            m.clear_quantized_weight_cache()
+
+
+@contextmanager
+def opd_generate_context(model):
+    """eval() so KV cache is not disabled by gradient checkpointing; freeze fake-quant W."""
+    was_training = model.training
+    config = getattr(model, "config", None)
+    prev_cache = getattr(config, "use_cache", None) if config is not None else None
+    model.eval()
+    if config is not None:
+        config.use_cache = True
+    try:
+        with freeze_fake_quant_for_generate(model):
+            yield
+    finally:
+        if config is not None and prev_cache is not None:
+            config.use_cache = prev_cache
+        if was_training:
+            model.train()
 
 def load_quantized_model_init(model_path, wbits, group_size, quantizer_class, use_flash_attn, scale=1.0, grad_scale=False):
     print(f"Initializing quantized model from {model_path}, {wbits}, {group_size}, {quantizer_class}")

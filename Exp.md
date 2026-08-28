@@ -182,6 +182,53 @@ output/eval/Qwen3-1.7B-w3g128-opd        # #2：Stage 1 + OPD
 
 ---
 
+## Exp #4（2026-08-28 新增）— 复现 ReasoningQAT 2-bit
+
+**要求：** 和 `#1` 同一套流水线（Stage 1 block QAT + Stage 2 离线 GKD：gold completion 上 JSD + 0.2 CE + 转 vLLM + 公共约定那套评测），把 bit 换成 **W2A16**。这是脚本默认档，也是原论文 1.7B 的主设置。不要 `--train-emb`。本实验**覆盖**公共约定里的「不要把 `--wbits` 改成 2」。
+
+和 `#1`（W3）不要混：自己训一份 Stage 1，产出目录是 `w2g128`，**不要覆盖** `w3g128`。
+
+| | Exp #1 | Exp #4 |
+|--|--|--|
+| 位宽 | W3A16 | **W2A16** |
+| Stage 1 `weight_lr` | `1e-5` | `2e-5` |
+| Stage 2 lr / epoch | `1e-6` / 1（512 step） | `5e-6` / **3（1536 step）** |
+| 产出 | `Qwen3-1.7B-w3g128` | `Qwen3-1.7B-w2g128` |
+
+其余与 `#1` 相同：OpenThoughts 32768、batch 64、`max_length=8192`、`top_k=20`、评测 T=0.6 / 8192。本实验只做 GKD 复现，**不要**跑 OPD。
+
+**依赖：** 无（不读 `#1` 的 Stage 1）。需要 `#1` 已经用过的环境、数据和 `MODEL_PATH`。
+
+**状态：** 未跑。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+bash scripts/run_qwen3_1.7b.sh --wbits 2 --gpus 0,1,2,3,4,5,6,7
+# 不是 8 卡：改 --gpus
+# 40G OOM：再加 --max-length 4096
+
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-1.7B-w2g128 \
+  ./output/eval/Qwen3-1.7B-w2g128
+```
+
+可拆成 `--stage 1` / `2` / `3`。冒烟：`LIMIT=1 bash scripts/eval_paper_benchmarks.sh ...`。
+
+产出：
+
+```
+output/block_qat/Qwen3-1.7B-w2g128
+output/distill/Qwen3-1.7B-w2g128
+output/vllm/Qwen3-1.7B-w2g128
+output/eval/Qwen3-1.7B-w2g128
+```
+
+和 `#1` 的 `output/eval/Qwen3-1.7B-w3g128` 对比。W2 的 Stage 2 是 3 epoch，比 W3 长约 3 倍。
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。

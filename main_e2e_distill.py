@@ -27,7 +27,7 @@ from tqdm import tqdm
 import utils
 from pathlib import Path
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-from quantize.int_linear_fake import load_quantized_model
+from quantize.int_linear_fake import load_quantized_model, opd_generate_context
 from accelerate import infer_auto_device_map, dispatch_model
 from trl import GKDConfig, GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
@@ -147,9 +147,12 @@ class PolicyGKDTrainer(GKDTrainer):
         """OPD: always roll out the student, then JSD (CE optional). GKD keeps lmbda=0 offline path."""
         if self.opd_mode:
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
-                )
+                # train() + gradient checkpointing forces use_cache=False (O(T^2) decode).
+                # Fake-quant also re-rounds full W every token unless cached.
+                with opd_generate_context(unwrapped_model):
+                    new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                        unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
+                    )
             prompt_len = inputs["prompts"].shape[1]
             new_labels = new_labels.clone()
             new_labels[:, :prompt_len] = -100
@@ -685,7 +688,6 @@ def main():
         # fp16=False,
         optim=args.optim,  # Changed from sgd to adamw (Adam with weight decay)
         # optim=
-        debug="underflow_overflow",
         dataloader_num_workers=1,
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=2,

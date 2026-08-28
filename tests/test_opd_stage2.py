@@ -223,6 +223,39 @@ def test_opd_flag_does_not_force_forward_kl():
     assert not forced, "--opd must not override kd_loss_type to forward_kl"
 
 
+def test_opd_generate_runs_in_eval_then_restores_train():
+    from quantize.int_linear_fake import opd_generate_context
+
+    model = TinyLM()
+    model.train()
+    with opd_generate_context(model):
+        assert model.training is False
+    assert model.training is True
+
+
+def test_cached_fake_quant_matches_live_forward():
+    from quantize.int_linear_fake import QuantLinear
+
+    torch.manual_seed(0)
+    linear = nn.Linear(8, 16, bias=False)
+    q = QuantLinear(linear, wbits=3, group_size=8)
+    q.set_quant_state(True)
+    x = torch.randn(2, 4, 8)
+    live = q(x)
+    q.cache_quantized_weight()
+    cached = q(x)
+    q.clear_quantized_weight_cache()
+    after = q(x)
+    assert torch.allclose(live, cached)
+    assert torch.allclose(live, after)
+    assert q._cached_weight is None
+
+
+def test_underflow_debug_not_enabled_for_opd():
+    src = (ROOT / "main_e2e_distill.py").read_text()
+    assert 'debug="underflow_overflow"' not in src
+
+
 if __name__ == "__main__":
     tests = [
         test_jsd_identical_is_zero,
@@ -234,6 +267,9 @@ if __name__ == "__main__":
         test_generation_budget_is_total_max_length_not_extra_new_tokens,
         test_scripts_gkd_vs_opd_flags,
         test_opd_flag_does_not_force_forward_kl,
+        test_opd_generate_runs_in_eval_then_restores_train,
+        test_cached_fake_quant_matches_live_forward,
+        test_underflow_debug_not_enabled_for_opd,
     ]
     for fn in tests:
         fn()
