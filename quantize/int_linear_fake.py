@@ -19,6 +19,17 @@ import os
 
 logger = getLogger(__name__)
 
+
+def resolve_attn_implementation(use_flash_attn=True):
+    """Prefer FlashAttention-2; fall back to SDPA if the package is missing."""
+    if use_flash_attn:
+        try:
+            import flash_attn  # noqa: F401
+            return "flash_attention_2"
+        except ImportError:
+            logger.warning("flash_attn not installed; using attn_implementation=sdpa")
+    return "sdpa"
+
 # 循環インポートを避けるため、必要な関数を直接定義
 def get_named_linears(module, type):
     return {name: m for name, m in module.named_modules() if isinstance(m, type)}
@@ -150,7 +161,7 @@ def opd_generate_context(model):
 
 def load_quantized_model_init(model_path, wbits, group_size, quantizer_class, use_flash_attn, scale=1.0, grad_scale=False):
     print(f"Initializing quantized model from {model_path}, {wbits}, {group_size}, {quantizer_class}")
-    attn_impl = "flash_attention_2" if use_flash_attn else "eager"
+    attn_impl = resolve_attn_implementation(use_flash_attn)
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, trust_remote_code=True, attn_implementation=attn_impl)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     layers = model.model.layers
@@ -174,7 +185,7 @@ def load_quantized_model(model_path, wbits, group_size, replace=False, strict=Fa
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
     with init_empty_weights():
-        attn_impl = "flash_attention_2" if use_flash_attn else "eager"
+        attn_impl = resolve_attn_implementation(use_flash_attn)
         model = AutoModelForCausalLM.from_config(config=config,torch_dtype=torch.float16, trust_remote_code=True, attn_implementation=attn_impl)
     layers = model.model.layers
     print(f"Loading models with {wbits} {group_size}")

@@ -1,4 +1,4 @@
-"""CPU checks that OnlineQAT Stage 2 OPD is wired as on-policy JSD (no CE).
+"""CPU checks that Stage 2 OPD matches slime's sampled reverse-KL objective.
 
 Does not load Qwen or run a full train step. Importing main_e2e_distill is safe
 because main() is behind ``if __name__``.
@@ -32,7 +32,7 @@ class TinyLM(nn.Module):
         self.vocab_size = vocab_size
         self.generation_config = GenerationConfig(pad_token_id=0, eos_token_id=1)
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
         logits = self.lm_head(self.embed(input_ids))
         loss = None
         if labels is not None:
@@ -77,6 +77,7 @@ def _bare_trainer(**kwargs):
     obj.kd_loss_type = kwargs.get("kd_loss_type", "jsd")
     obj.mean_prob = 0
     obj.beta = kwargs.get("beta", 1.0)
+    obj.temperature = kwargs.get("temperature", 1.0)
     obj.opd_mode = kwargs.get("opd_mode", True)
     obj.teacher_model = kwargs["teacher_model"]
     return obj
@@ -112,6 +113,39 @@ def test_jsd_beta1_is_forward_kl():
     t_log = F.log_softmax(teacher, dim=-1)
     ref = F.kl_div(s_log, t_log, reduction="none", log_target=True).sum(-1).mean()
     assert torch.allclose(got, ref, atol=1e-5), (got, ref)
+
+
+def test_sampled_reverse_kl_matches_policy_gradient_surrogate():
+    torch.manual_seed(2)
+    student = torch.randn(2, 4, 10, requires_grad=True)
+    teacher = torch.randn(2, 4, 10)
+    labels = torch.tensor([[1, 2, -100, 4], [3, -100, 5, 6]])
+    temperature = 0.7
+
+    got = PolicyGKDTrainer.sampled_reverse_kl_policy_loss(
+        student, teacher, labels, temperature=temperature
+    )
+
+    mask = labels != -100
+    safe_labels = labels.masked_fill(~mask, 0).unsqueeze(-1)
+    student_logp = F.log_softmax(student / temperature, dim=-1).gather(-1, safe_labels).squeeze(-1)
+    teacher_logp = F.log_softmax(teacher / temperature, dim=-1).gather(-1, safe_labels).squeeze(-1)
+    expected = (((student_logp - teacher_logp).detach() * student_logp)[mask]).mean()
+
+    assert torch.allclose(got, expected, atol=1e-5), (got, expected)
+    got.backward()
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+def test_sampled_reverse_kl_identical_policies_has_zero_gradient():
+    logits = torch.randn(2, 5, 11)
+    student = logits.clone().requires_grad_(True)
+    labels = torch.randint(0, 11, (2, 5))
+    loss = PolicyGKDTrainer.sampled_reverse_kl_policy_loss(student, logits, labels)
+    loss.backward()
+    assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-6)
+    assert torch.allclose(student.grad, torch.zeros_like(student.grad), atol=1e-6)
 
 
 def test_compute_loss_ce0_ignores_gold_labels():
@@ -196,6 +230,28 @@ def test_generation_budget_is_total_max_length_not_extra_new_tokens():
     assert out.shape[1] == 32
 
 
+def test_opd_masks_keep_first_eos_and_drop_later_padding():
+    generated = torch.tensor(
+        [
+            [0, 7, 8, 11, 1, 1],
+            [0, 9, 10, 12, 13, 14],
+        ]
+    )
+    prompt_mask = torch.tensor([[0, 1, 1], [0, 1, 1]])
+    attention_mask, labels = PolicyGKDTrainer.build_opd_masks(
+        generated_tokens=generated,
+        prompt_attention_mask=prompt_mask,
+        eos_token_id=1,
+        pad_token_id=1,
+    )
+
+    assert attention_mask.tolist() == [[0, 1, 1, 1, 1, 0], [0, 1, 1, 1, 1, 1]]
+    assert labels.tolist() == [
+        [-100, -100, -100, 11, 1, -100],
+        [-100, -100, -100, 12, 13, 14],
+    ]
+
+
 def test_scripts_gkd_vs_opd_flags():
     gkd = (ROOT / "scripts" / "run_qwen3_1.7b.sh").read_text()
     opd = (ROOT / "scripts" / "run_qwen3_1.7b_opd.sh").read_text()
@@ -204,23 +260,53 @@ def test_scripts_gkd_vs_opd_flags():
     assert "--kd_loss_type jsd" in gkd
     assert "--opd \\" in opd or "--opd\n" in opd
     assert "--cross_entropy_weight 0.0" in opd
-    assert "--kd_loss_type jsd" in opd
+    assert "--top_k" not in opd
+    assert "sampled reverse KL" in opd
     assert "block_qat" in opd
     assert "-opd" in opd
+    assert "--save-steps" in opd
+    assert "--max-steps" in opd
+    assert "eval_distill_checkpoints.sh" in opd
 
 
-def test_opd_flag_does_not_force_forward_kl():
+def test_save_quantized_eval_checkpoint_restores_weights():
+    import tempfile
+
+    from quantize.int_linear_fake import QuantLinear
+    from main_e2e_distill import save_quantized_eval_checkpoint
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q = QuantLinear(nn.Linear(8, 4, bias=False), wbits=2, group_size=8)
+
+        def save_pretrained(self, path):
+            raise RuntimeError("do not save")
+
+    model = Tiny()
+    model.q.set_quant_state(True)
+    before = model.q.weight.data.clone()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            save_quantized_eval_checkpoint(model, None, tmp)
+        except RuntimeError:
+            pass
+    assert torch.equal(model.q.weight.data, before)
+    assert model.q.use_weight_quant is True
+
+
+def test_opd_dispatches_sampled_reverse_kl():
     src = (ROOT / "main_e2e_distill.py").read_text()
     tree = ast.parse(src)
-    forced = False
+    dispatches_sampled_reverse_kl = False
     for node in ast.walk(tree):
         if isinstance(node, ast.If):
             test = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
-            if "args.opd" in test:
+            if "self.opd_mode" in test:
                 body = ast.unparse(node) if hasattr(ast, "unparse") else ""
-                if "kd_loss_type" in body and "forward_kl" in body:
-                    forced = True
-    assert not forced, "--opd must not override kd_loss_type to forward_kl"
+                if "sampled_reverse_kl_policy_loss" in body:
+                    dispatches_sampled_reverse_kl = True
+    assert dispatches_sampled_reverse_kl
 
 
 def test_opd_generate_runs_in_eval_then_restores_train():
@@ -261,12 +347,16 @@ if __name__ == "__main__":
         test_jsd_identical_is_zero,
         test_jsd_masks_prompt_and_pad,
         test_jsd_beta1_is_forward_kl,
+        test_sampled_reverse_kl_matches_policy_gradient_surrogate,
+        test_sampled_reverse_kl_identical_policies_has_zero_gradient,
         test_compute_loss_ce0_ignores_gold_labels,
         test_compute_loss_ce0_has_no_ce_graph,
         test_opd_replaces_batch_with_student_rollout_and_masks_prompt,
         test_generation_budget_is_total_max_length_not_extra_new_tokens,
+        test_opd_masks_keep_first_eos_and_drop_later_padding,
         test_scripts_gkd_vs_opd_flags,
-        test_opd_flag_does_not_force_forward_kl,
+        test_save_quantized_eval_checkpoint_restores_weights,
+        test_opd_dispatches_sampled_reverse_kl,
         test_opd_generate_runs_in_eval_then_restores_train,
         test_cached_fake_quant_matches_live_forward,
         test_underflow_debug_not_enabled_for_opd,

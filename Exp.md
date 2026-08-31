@@ -229,6 +229,73 @@ output/eval/Qwen3-1.7B-w2g128
 
 ---
 
+## Exp #5（2026-09-01 新增）— W2 Stage 2 OPD，接 #4 的 Stage 1，每 5 step 存评测
+
+**要求：** 不要重训 Stage 1。**直接读 Exp #4 Stage 1 训完的** `output/block_qat/Qwen3-1.7B-w2g128`，在这份 W2 checkpoint 上只跑 OPD **Stage 2**（student rollout + sampled reverse KL，不要 CE）。**最多 100 optimizer step**（不要跑满 W2 的 3 epoch / 1536 step）。**8 卡**训练。训练过程中 **每 5 个 step 存一份可转换 checkpoint**；8 卡占满训练，评测等 Stage 2 结束后再排队 convert + 公共约定那套 evalscope。不要 `--train-emb`。本实验覆盖公共约定里的「不要把 `--wbits` 改成 2」。
+
+不要用 OPD 脚本的 `--stage all` / Stage 3：中间评测由 `eval_distill_checkpoints.sh` 做 convert，不写最终的 `output/vllm/Qwen3-1.7B-w2g128-opd`（避免和 #4 的 GKD `w2g128` 混）。产出后缀是 `w2g128-opd`。`#4` 的 Stage 2 GKD 可以同时跑，两边读同一份 Stage 1，写出目录不同。
+
+| | Exp #2 | Exp #4 | Exp #5 |
+|--|--|--|--|
+| 位宽 | W3 | W2 GKD | **W2 OPD** |
+| Stage 1 | `#1` 的 `w3g128` | **自己训 `w2g128`** | **不训，读 `#4` 这份** |
+| Stage | 2+3 | 1+2+3 | **只 Stage 2，最多 100 step** |
+| 中间 ckpt | 无 | 无 | **每 5 step** |
+| 评测 | 训完再评 | 训完再评 | **每 5 step 存一份，训完 8 卡后排队评** |
+
+本实验 **截断到 100 step**（`--max-steps 100`），每 5 step 约 **20 个评测点**（checkpoint-5 … checkpoint-100）再加一份 `final`。默认评完后删掉该 step 的 distill/vLLM 权重（只留 `output/eval/...`）；若要留权重：`KEEP_CHECKPOINTS=1`。
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`（**Exp #4 `--stage 1` 完成**）。没有就等 `#4` 的 Stage 1，不要在本实验里重跑 `run_qwen3_1.7b.sh --stage 1`。OPD 脚本不训 Stage 1；缺这份 checkpoint 时 `--stage 2` 会立刻退出。
+
+**状态：** 未跑。脚本已接 `--max-steps` / `--save-steps` / `--eval-gpu`。把代码同步到新集群后，等 `#4` Stage 1 写完再跑下面。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+# 必须是 #4 Stage 1 的产物，不是另训一份
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+# Stage 2 OPD：8 卡，每 5 step 存 ckpt，最多 100 step
+# 40G OOM：再加 --max-length 4096
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 --max-steps 100 --save-steps 5
+
+# 训练占满 8 卡，评测等结束后用 GPU 0 排队 convert+eval
+bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/Qwen3-1.7B-w2g128-opd \
+  --wbits 2 --eval-gpu 0
+```
+
+可选自检（不占 GPU）：
+
+```bash
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=. python tests/test_opd_stage2.py
+```
+
+看评测是否在跟：
+
+```bash
+tail -f log/eval/Qwen3-1.7B-w2g128-opd/watcher.log
+ls output/eval/Qwen3-1.7B-w2g128-opd
+```
+
+产出：
+
+```
+output/block_qat/Qwen3-1.7B-w2g128          # 依赖：#4 Stage 1
+output/distill/Qwen3-1.7B-w2g128-opd        # Stage 2 最终权重 + checkpoint-*（评完默认删中间点）
+output/eval/Qwen3-1.7B-w2g128-opd/checkpoint-5
+output/eval/Qwen3-1.7B-w2g128-opd/checkpoint-10
+...
+output/eval/Qwen3-1.7B-w2g128-opd/checkpoint-100
+output/eval/Qwen3-1.7B-w2g128-opd/final     # step 100 结束后的整模评测
+```
+
+和 `#4` 的 `output/eval/Qwen3-1.7B-w2g128`（GKD）对比。不要覆盖 `#4`。
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。

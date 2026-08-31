@@ -26,12 +26,11 @@ import torch.nn as nn
 from tqdm import tqdm
 import utils
 from pathlib import Path
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-from quantize.int_linear_fake import load_quantized_model, opd_generate_context
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, TrainerCallback
+from quantize.int_linear_fake import load_quantized_model, opd_generate_context, resolve_attn_implementation
 from accelerate import infer_auto_device_map, dispatch_model
 from trl import GKDConfig, GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
-from trl.trainer.utils import empty_cache
 from datasets import load_dataset
 import copy
 import quantize.int_linear_fake as int_linear_fake
@@ -41,7 +40,6 @@ from functools import partial
 from typing import Optional
 import torch.nn.functional as F
 from dataclasses import dataclass
-from transformers.trainer_utils import get_last_checkpoint
 
 torch.backends.cudnn.benchmark = True
 
@@ -143,19 +141,96 @@ class PolicyGKDTrainer(GKDTrainer):
             return kl.sum() / mask.sum().clamp(min=1)
         return kl.mean()
 
+    @staticmethod
+    def sampled_reverse_kl_policy_loss(
+        student_logits,
+        teacher_logits,
+        labels,
+        temperature=1.0,
+    ):
+        """Monte Carlo policy-gradient estimator of KL(student || teacher).
+
+        ``labels`` are tokens sampled from the student policy. The sampled
+        reverse-KL value is detached and used as a policy-gradient weight,
+        matching slime's OPD objective without materializing full-vocabulary
+        probability tensors.
+        """
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+
+        valid_mask = labels != -100
+        safe_labels = labels.masked_fill(~valid_mask, 0).unsqueeze(-1)
+
+        if temperature != 1.0:
+            student_logits = student_logits / temperature
+            teacher_logits = teacher_logits / temperature
+
+        student_token_logits = student_logits.gather(-1, safe_labels).squeeze(-1)
+        student_log_probs = student_token_logits - torch.logsumexp(student_logits, dim=-1)
+        with torch.no_grad():
+            teacher_token_logits = teacher_logits.gather(-1, safe_labels).squeeze(-1)
+            teacher_log_probs = teacher_token_logits - torch.logsumexp(teacher_logits, dim=-1)
+            sampled_reverse_kl = student_log_probs.detach() - teacher_log_probs
+
+        # grad E_{a~pi_s}[log pi_s(a) - log pi_t(a)]
+        # = E[(log pi_s(a) - log pi_t(a) + 1) grad log pi_s(a)].
+        # The omitted +1 is a constant baseline with zero expected gradient.
+        per_token_loss = sampled_reverse_kl * student_log_probs
+        return per_token_loss[valid_mask].sum() / valid_mask.sum().clamp_min(1)
+
+    @staticmethod
+    def build_opd_masks(
+        generated_tokens,
+        prompt_attention_mask,
+        eos_token_id,
+        pad_token_id,
+    ):
+        """Mask prompt/padding while retaining the first generated EOS token."""
+        prompt_length = prompt_attention_mask.shape[1]
+        response_tokens = generated_tokens[:, prompt_length:]
+        response_mask = torch.ones_like(response_tokens, dtype=torch.bool)
+
+        if eos_token_id is not None and response_tokens.numel() > 0:
+            eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+            is_eos = torch.zeros_like(response_tokens, dtype=torch.bool)
+            for token_id in eos_ids:
+                is_eos |= response_tokens == token_id
+            eos_seen_before = is_eos.cumsum(dim=-1) - is_eos.to(torch.int64)
+            response_mask &= eos_seen_before == 0
+
+        eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+        if pad_token_id is not None and pad_token_id not in eos_ids:
+            response_mask &= response_tokens != pad_token_id
+
+        attention_mask = torch.cat(
+            [prompt_attention_mask.to(torch.bool), response_mask],
+            dim=1,
+        ).to(torch.long)
+        labels = generated_tokens.clone()
+        labels[:, :prompt_length] = -100
+        labels[:, prompt_length:].masked_fill_(~response_mask, -100)
+        return attention_mask, labels
+
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """OPD: always roll out the student, then JSD (CE optional). GKD keeps lmbda=0 offline path."""
+        """OPD: roll out the student before applying sampled reverse KL."""
         if self.opd_mode:
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 # train() + gradient checkpointing forces use_cache=False (O(T^2) decode).
                 # Fake-quant also re-rounds full W every token unless cached.
                 with opd_generate_context(unwrapped_model):
-                    new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                    new_input_ids, _, _ = self.generate_on_policy_outputs(
                         unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                     )
-            prompt_len = inputs["prompts"].shape[1]
-            new_labels = new_labels.clone()
-            new_labels[:, :prompt_len] = -100
+            prompt_attention_mask = inputs.get(
+                "prompt_attention_mask",
+                torch.ones_like(inputs["prompts"]),
+            )
+            new_attention_mask, new_labels = self.build_opd_masks(
+                generated_tokens=new_input_ids,
+                prompt_attention_mask=prompt_attention_mask,
+                eos_token_id=self.generation_config.eos_token_id,
+                pad_token_id=self.processing_class.pad_token_id,
+            )
             inputs = dict(inputs)
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
@@ -277,7 +352,8 @@ class PolicyGKDTrainer(GKDTrainer):
         student_outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            labels=inputs["labels"] if need_ce and not (self.use_teacher_weight or self.use_dft_loss) else None
+            labels=inputs["labels"] if need_ce and not (self.use_teacher_weight or self.use_dft_loss) else None,
+            use_cache=False,
         )
 
         # compute teacher output in eval mode (BitDistiller style - no device movement)
@@ -286,6 +362,7 @@ class PolicyGKDTrainer(GKDTrainer):
             teacher_outputs = self.teacher_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
+                use_cache=False,
             )
 
         # Extract teacher logits before deleting teacher_outputs
@@ -294,12 +371,15 @@ class PolicyGKDTrainer(GKDTrainer):
         # Delete teacher_outputs to free memory (keeps only logits)
         del teacher_outputs
 
-        # slice the logits for the generated tokens using the inputs["prompts"] lengths
-        prompt_lengths = inputs["prompts"].shape[1]
-
         # currently we only support next token prediction
-        shifted_student_logits = student_outputs.logits[:, :-1, :].contiguous()
-        shifted_teacher_logits = teacher_logits[:, :-1, :].contiguous()
+        # OPD only gathers sampled-token log-probs, so views avoid duplicating
+        # the large [batch, sequence, vocabulary] tensors.
+        make_contiguous = not self.opd_mode
+        shifted_student_logits = student_outputs.logits[:, :-1, :]
+        shifted_teacher_logits = teacher_logits[:, :-1, :]
+        if make_contiguous:
+            shifted_student_logits = shifted_student_logits.contiguous()
+            shifted_teacher_logits = shifted_teacher_logits.contiguous()
         shifted_labels = inputs["labels"][:, 1:].contiguous().to(shifted_student_logits.device)
 
         # Delete original logits to free memory
@@ -307,7 +387,14 @@ class PolicyGKDTrainer(GKDTrainer):
 
         # KL divergence loss
         if self.kl_weight > 0.0:
-            if self.kd_loss_type == "forward_kl":
+            if self.opd_mode:
+                kl_loss = self.sampled_reverse_kl_policy_loss(
+                    student_logits=shifted_student_logits,
+                    teacher_logits=shifted_teacher_logits,
+                    labels=shifted_labels,
+                    temperature=self.temperature,
+                )
+            elif self.kd_loss_type == "forward_kl":
                 kl_loss = self.forward_kl_loss(
                     student_logits=shifted_student_logits,
                     teacher_logits=shifted_teacher_logits,
@@ -368,11 +455,68 @@ class PolicyGKDTrainer(GKDTrainer):
         if not return_outputs:
             del student_outputs
 
-        # empty cache
-        empty_cache()
-
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
+
+
+@torch.no_grad()
+def save_quantized_eval_checkpoint(model, tokenizer, save_dir):
+    """Write a convert-ready snapshot without leaving training weights quantized.
+
+    Matches the end-of-training save (fake-quant weights baked into ``.weight``)
+    so ``convert_to_hf_vllm_compatible_model.py`` can load it. Master weights
+    and ``use_weight_quant`` are restored before returning.
+    """
+    from quantize.int_linear_fake import QuantLinear
+
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    backups = []
+    prev_states = []
+    try:
+        for module in model.modules():
+            if isinstance(module, QuantLinear):
+                backups.append((module, module.weight.data.detach().cpu().clone()))
+                prev_states.append((module, module.use_weight_quant))
+                quantized = module.weight_quantizer(module.weight.data)
+                module.weight.data.copy_(quantized)
+        set_quant_state(model, weight_quant=False)
+        model.save_pretrained(str(save_path))
+        if tokenizer is not None:
+            tokenizer.save_pretrained(str(save_path))
+        (save_path / ".ready").touch()
+    finally:
+        for module, weight in backups:
+            module.weight.data.copy_(weight.to(device=module.weight.device, dtype=module.weight.dtype))
+        for module, was_quant in prev_states:
+            module.use_weight_quant = was_quant
+        if not prev_states:
+            set_quant_state(model, weight_quant=True)
+
+
+class QuantEvalSnapshotCallback(TrainerCallback):
+    """Every ``save_steps`` optimizer steps, dump a vLLM-convertible checkpoint."""
+
+    def __init__(self, save_quant_dir, tokenizer, save_steps):
+        self.save_quant_dir = save_quant_dir
+        self.tokenizer = tokenizer
+        self.save_steps = int(save_steps)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self.save_steps <= 0 or not self.save_quant_dir:
+            return
+        if state.global_step <= 0 or state.global_step % self.save_steps != 0:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        if state.is_world_process_zero and model is not None:
+            unwrapped = model.module if hasattr(model, "module") else model
+            ckpt_dir = os.path.join(self.save_quant_dir, f"checkpoint-{state.global_step}")
+            print(f"[save] quantized eval snapshot step={state.global_step} -> {ckpt_dir}", flush=True)
+            save_quantized_eval_checkpoint(unwrapped, self.tokenizer, ckpt_dir)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
 
 @torch.no_grad()
 def evaluate(model, tokenizer, args, logger):
@@ -603,6 +747,8 @@ def main():
     parser.add_argument("--model", type=str, help="model name of model path")
     parser.add_argument("--output_dir", default="./log/", type=str, help="direction of logging file")
     parser.add_argument("--save_quant_dir", default=None, type=str, help="direction for saving quantization model")
+    parser.add_argument("--save_steps", type=int, default=0, help="Save a convert-ready quantized snapshot every N optimizer steps (0=final only)")
+    parser.add_argument("--max_steps", type=int, default=-1, help="Cap optimizer steps (-1=use epochs)")
     parser.add_argument("--calib_dataset",type=str,default="redpajama",
         choices=["wikitext2", "ptb", "c4", "mix", "redpajama", "random"],
         help="Where to extract calibration data from.")
@@ -635,7 +781,7 @@ def main():
     parser.add_argument("--train_emb", action="store_true", help="Enable training of embedding tokens (embed_tokens). Default is False.")
 
     parser.add_argument("--kd_loss_type", type=str, default="jsd", choices=["jsd", "cakld", "forward_kl"], help="Knowledge distillation loss type: 'jsd' for generalized_jsd_loss, 'cakld' for cakld_loss, 'forward_kl' for OPD KL(teacher||student)")
-    parser.add_argument("--opd", action="store_true", help="On-policy distillation: student rollouts + forward KL. Same data/hparams as GKD; only the Stage-2 state source and KL form change.")
+    parser.add_argument("--opd", action="store_true", help="On-policy distillation: student rollouts + sampled reverse-KL policy gradient, matching slime OPD.")
     parser.add_argument("--cakld_steps", type=int, default=100, help="Number of steps to calculate mean probability for CAKLD loss")
     parser.add_argument("--enable_efficient_qat", action="store_true", help="Enable efficient QAT mode: only train scale parameters, freeze all other parameters")
 
@@ -668,6 +814,7 @@ def main():
     training_args = GKDConfig(
         beta=1.0, # KL(student || teacher)
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         max_length=args.max_length,
         max_new_tokens=opd_gen_tokens if args.opd else 128,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -677,6 +824,7 @@ def main():
         adam_beta1=0.9,     # Default AdamW beta1
         adam_beta2=0.95,   # Default AdamW beta2
         output_dir=args.output_dir,
+        save_strategy="no",
         gradient_checkpointing=True,
         seq_kd=False, # enforce supervised KD
         lmbda=1.0 if args.opd else 0.0,
@@ -721,7 +869,7 @@ def main():
         args.teacher_model,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation=resolve_attn_implementation(True),
         device_map=None  # Keep on CPU for now
     )
     teacher_model = teacher_model.to("cpu").eval()
@@ -901,6 +1049,13 @@ def main():
 
         logger.info(f"[MEMORY] Rank {local_rank} - After mean_prob cleanup - GPU {local_rank}: {torch.cuda.memory_allocated(local_rank) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(local_rank) / 1024**3:.2f} GB reserved")
 
+    callbacks = []
+    if args.save_steps and args.save_steps > 0 and args.save_quant_dir:
+        callbacks.append(
+            QuantEvalSnapshotCallback(args.save_quant_dir, tokenizer, args.save_steps)
+        )
+        logger.info(f"Quant eval snapshots every {args.save_steps} steps -> {args.save_quant_dir}/checkpoint-*")
+
     trainer = PolicyGKDTrainer(
         kl_weight=args.kl_weight,
         cross_entropy_weight=args.cross_entropy_weight,
@@ -916,6 +1071,7 @@ def main():
         data_collator=data_collator,
         args=training_args,
         train_dataset=dataset,
+        callbacks=callbacks or None,
         # optimizers=(optimizer, None),
     )
     if args.opd:

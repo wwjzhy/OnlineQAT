@@ -181,14 +181,15 @@ def main():
             current_wbits = wbits_from_path if wbits_from_path is not None else args.wbits
             current_group_size = group_size_from_path if group_size_from_path is not None else args.group_size
 
-            from quantize.int_linear_fake import load_quantized_model
+            from quantize.int_linear_fake import load_quantized_model, resolve_attn_implementation
             model, tokenizer = load_quantized_model(args.model, current_wbits, current_group_size, replace=True, strict=True, quantizer_class=args.quantizer_class)
             logger.info(f"Loaded quantized model with wbits={current_wbits}, group_size={current_group_size}")
         else:
             # load fp quantized model
+            from quantize.int_linear_fake import resolve_attn_implementation
             config = AutoConfig.from_pretrained(args.model)
             tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False, legacy=False, trust_remote_code=True)
-            model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cuda', torch_dtype=torch.float16, trust_remote_code=True, attn_implementation='flash_attention_2')
+            model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cuda', torch_dtype=torch.float16, trust_remote_code=True, attn_implementation=resolve_attn_implementation(True))
         for param in model.parameters():
             param.requires_grad = False
 

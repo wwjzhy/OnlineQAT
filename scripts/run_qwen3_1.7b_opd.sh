@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Qwen3-1.7B ReasoningQAT Stage 2/3 with OPD (student rollout + JSD).
+# Qwen3-1.7B ReasoningQAT Stage 2/3 with OPD (student rollout + sampled reverse KL).
 #
 # Same data and hparams as scripts/run_qwen3_1.7b.sh. Difference:
 #   GKD  offline JSD+CE on OpenThoughts gold completions
-#   OPD  student generates, then JSD only (no CE / gold SFT)
+#   OPD  student generates, then sampled reverse-KL policy gradient (no CE / gold SFT)
 #
 # Stage 1 is NOT run here. Train it once with:
 #   bash scripts/run_qwen3_1.7b.sh --wbits 3 --stage 1
@@ -24,6 +24,9 @@ GROUP_SIZE=128
 STAGE="all"
 TRAIN_EMB=0
 SKIP_EXISTING=0
+SAVE_STEPS="${SAVE_STEPS:-0}"
+EVAL_GPU="${EVAL_GPU:-}"
+MAX_STEPS="${MAX_STEPS:-0}"
 
 MODEL="${MODEL_PATH:-/zju_0038/zq/models/Qwen3-1.7B}"
 TEACHER="${TEACHER_MODEL:-${MODEL}}"
@@ -60,6 +63,9 @@ Options:
   --teacher PATH         Teacher model for Stage 2 (default: same as --model)
   --train-emb            Also train embed_tokens in Stage 2
   --skip-existing        Skip a stage if its output dir already has config.json
+  --save-steps N         Save a convert-ready snapshot every N Stage 2 steps (0=off)
+  --max-steps N          Cap Stage 2 optimizer steps (0=use epochs; Exp #5 uses 100)
+  --eval-gpu ID          GPU for convert+evalscope watcher (requires --save-steps > 0)
   -h, --help             Show this help
 
 Environment overrides: same as scripts/run_qwen3_1.7b.sh
@@ -76,6 +82,9 @@ while [[ $# -gt 0 ]]; do
     --teacher) TEACHER="$2"; shift 2 ;;
     --train-emb) TRAIN_EMB=1; shift ;;
     --skip-existing) SKIP_EXISTING=1; shift ;;
+    --save-steps) SAVE_STEPS="$2"; shift 2 ;;
+    --max-steps) MAX_STEPS="$2"; shift 2 ;;
+    --eval-gpu) EVAL_GPU="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -166,14 +175,38 @@ if [[ "${TRAIN_EMB}" -eq 1 ]]; then
   TRAIN_EMB_FLAG="--train_emb"
 fi
 
+SAVE_STEPS_FLAG=""
+if [[ "${SAVE_STEPS}" -gt 0 ]]; then
+  SAVE_STEPS_FLAG="--save_steps ${SAVE_STEPS}"
+fi
+
+MAX_STEPS_FLAG=""
+if [[ "${MAX_STEPS}" -gt 0 ]]; then
+  MAX_STEPS_FLAG="--max_steps ${MAX_STEPS}"
+fi
+
+if [[ -n "${EVAL_GPU}" ]]; then
+  case ",${DISTILL_GPUS}," in
+    *",${EVAL_GPU},"*)
+      echo "--eval-gpu ${EVAL_GPU} overlaps Stage 2 GPUs ${DISTILL_GPUS}" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "${SAVE_STEPS}" -le 0 ]]; then
+    echo "--eval-gpu requires --save-steps N with N>0" >&2
+    exit 1
+  fi
+fi
+
 echo "============================================================"
-echo "Qwen3-1.7B ReasoningQAT (OPD, JSD on student rollouts)"
+echo "Qwen3-1.7B ReasoningQAT (OPD, sampled reverse KL on student rollouts)"
 echo "  wbits=${WBITS}  group_size=${GROUP_SIZE}  stage=${STAGE}"
 echo "  model=${MODEL}"
 echo "  teacher=${TEACHER}"
 echo "  python=${PY}"
 echo "Stage 2 GPUs: ${DISTILL_GPUS}  (${N_DISTILL_GPUS} GPU, accum=${GRAD_ACCUM}, effective_batch=${EFFECTIVE_BATCH}, max_length=${MAX_LENGTH})"
-echo "  same hparams as GKD except no CE; student generate then JSD only"
+echo "  student generate then sampled reverse-KL policy gradient; no CE"
+echo "  save_steps=${SAVE_STEPS}  max_steps=${MAX_STEPS:-epochs}  eval_gpu=${EVAL_GPU:-none}"
 echo "Stage 3 GPU : ${CONVERT_GPU}"
 echo "Inputs / outputs:"
 echo "  block   ${BLOCK_DIR}   (from run_qwen3_1.7b.sh Stage 1)"
@@ -183,7 +216,7 @@ echo "============================================================"
 nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv || true
 
 # ---------------------------------------------------------------------------
-# Stage 2: On-policy JSD (same loss as GKD)
+# Stage 2: On-policy sampled reverse KL (slime-compatible objective)
 # ---------------------------------------------------------------------------
 if run_stage 2; then
   if [[ ! -f "${BLOCK_DIR}/config.json" ]]; then
@@ -196,6 +229,26 @@ if run_stage 2; then
   else
     echo "[stage2] OPD e2e distill on GPUs ${DISTILL_GPUS} (effective_batch=${EFFECTIVE_BATCH})"
     mkdir -p "${DISTILL_DIR}" "${DISTILL_LOG}"
+    rm -f "${DISTILL_DIR}/.train_done"
+    EVAL_WATCHER_PID=""
+    mark_train_done() {
+      mkdir -p "${DISTILL_DIR}"
+      touch "${DISTILL_DIR}/.train_done"
+    }
+    trap mark_train_done EXIT
+    if [[ -n "${EVAL_GPU}" ]]; then
+      echo "[stage2] eval watcher on GPU ${EVAL_GPU} (every ${SAVE_STEPS} steps)"
+      mkdir -p "${ROOT}/log/eval/${DISTILL_TAG}"
+      bash "${ROOT}/scripts/eval_distill_checkpoints.sh" \
+        --watch-dir "${DISTILL_DIR}" \
+        --wbits "${WBITS}" \
+        --group-size "${GROUP_SIZE}" \
+        --eval-gpu "${EVAL_GPU}" \
+        --tag "${DISTILL_TAG}" \
+        >>"${ROOT}/log/eval/${DISTILL_TAG}/watcher.log" 2>&1 &
+      EVAL_WATCHER_PID="$!"
+      echo "[stage2] eval watcher pid=${EVAL_WATCHER_PID}"
+    fi
     CUDA_VISIBLE_DEVICES="${DISTILL_GPUS}" accelerate launch \
       --config_file "${ROOT}/configs/accelerate_config_multigpu.yaml" \
       --num_processes "${N_DISTILL_GPUS}" \
@@ -209,8 +262,6 @@ if run_stage 2; then
       --learning_rate "${DISTILL_LR}" \
       --kl_weight 1.0 \
       --cross_entropy_weight 0.0 \
-      --kd_loss_type jsd \
-      --top_k 20 \
       --opd \
       --dataset_type "${DATASET_TYPE}" \
       --dataset_size "${DATASET_SIZE}" \
@@ -218,9 +269,15 @@ if run_stage 2; then
       --per_device_train_batch_size "${PER_DEVICE_BATCH}" \
       --gradient_accumulation_steps "${GRAD_ACCUM}" \
       ${TRAIN_EMB_FLAG} \
+      ${SAVE_STEPS_FLAG} \
+      ${MAX_STEPS_FLAG} \
       --save_quant_dir "${DISTILL_DIR}" \
       --output_dir "${DISTILL_LOG}"
+    touch "${DISTILL_DIR}/.ready" "${DISTILL_DIR}/.train_done"
     echo "[stage2] done -> ${DISTILL_DIR}"
+    if [[ -n "${EVAL_WATCHER_PID}" ]]; then
+      echo "[stage2] eval watcher still running pid=${EVAL_WATCHER_PID} (log/eval/${DISTILL_TAG}/watcher.log)"
+    fi
   fi
 fi
 
