@@ -296,6 +296,104 @@ output/eval/Qwen3-1.7B-w2g128-opd/final     # step 100 结束后的整模评测
 
 ---
 
+## Exp #6（2026-09-01 新增）— PV-OPD FullPair：W2 rollout + W4 精度验证
+
+**要求：** 直接读取 Exp #4 Stage 1 的
+`output/block_qat/Qwen3-1.7B-w2g128`，不要重训 Stage 1。W2 target
+负责 rollout；冻结的 BF16 Teacher 和共享当前主权重、group、实数 clipping
+range 的 W4 Probe 在同一条 W2 轨迹上打分。使用 W4 恢复方向/幅度生成
+precision gate，加权现有 sampled reverse-KL。不要切换成 PPO ratio loss。
+
+这是 **FullPair** 版本：更新 W2 的完整 master weights、非量化权重和
+quantizer scale；`zero_point`、embedding、BF16 Teacher 与 W4 Probe 都不更新。
+W4 只是 W2 量化器的临时 precision view，不单独保存 checkpoint。
+
+**依赖：**
+
+```
+output/block_qat/Qwen3-1.7B-w2g128/config.json   # Exp #4 Stage 1
+```
+
+**状态：** 代码已实现，正式 8 卡实验未跑。
+
+主实验（8 卡、effective batch 64、最多 100 optimizer step、每 5 step 存一次）：
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+bash scripts/run_qwen3_1.7b_pv_opd.sh \
+  --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --probe-bits 4 \
+  --max-steps 100 \
+  --save-steps 5 \
+  --gate-mode full
+```
+
+8 卡训练结束后，在 25/50/75/100 step 跑 Math/Code 主评测（保留 checkpoint，
+以便失败后重跑）：
+
+```bash
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="aime24 aime25 math_500 live_code_bench" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/Qwen3-1.7B-w2g128-pv-opd \
+  --wbits 2 --eval-gpu 0 \
+  --steps 25,50,75,100 --skip-final
+
+# final 转标准 HF/vLLM 后跑公共约定完整套件
+bash scripts/run_qwen3_1.7b_pv_opd.sh --stage 3
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-1.7B-w2g128-pv-opd \
+  ./output/eval/Qwen3-1.7B-w2g128-pv-opd/final
+```
+
+产出：
+
+```
+output/distill/Qwen3-1.7B-w2g128-pv-opd
+output/eval/Qwen3-1.7B-w2g128-pv-opd/checkpoint-{25,50,75,100}
+output/eval/Qwen3-1.7B-w2g128-pv-opd/final
+log/distill/Qwen3-1.7B-w2g128-pv-opd
+```
+
+### 验证矩阵
+
+所有方法必须使用相同 Stage 1、prompt 顺序、seed、8 卡、effective batch=64、
+100 steps、rollout budget 和可训练参数。
+
+1. Step 0：Exp #4 Stage 1 W2。
+2. Standard OPD-FullPair：Exp #5，`g=1`。
+3. PV-OPD-FullPair：本实验，`--gate-mode full`。
+4. Sign-only 消融：本脚本加 `--gate-mode sign`，输出后缀 `-pv-opd-sign`。
+5. Shuffled-gate 消融：本脚本加 `--gate-mode shuffled`，输出后缀
+   `-pv-opd-shuffled`；保持 gate 稀疏率，检验收益是否只是稀疏正则化。
+
+训练日志记录 gate keep-rate/均值、同号率、`|A_FP|`、`|A_prec|`、P99
+adv clip、四段 token position 的 sampled-KL，以及数字/运算符/代码符号/普通
+文本的 gate 均值。
+
+每 5 step 保存 checkpoint 并检查上述固定诊断；公开 benchmark 建议只在
+step 0/25/50/75/100 跑 AIME24/25、MATH-500、LiveCodeBench，最终模型再跑
+公共约定的完整套件。判断成立要求：PV-OPD 在同一训练预算下稳定优于
+Standard OPD，且优于 shuffled-gate；收益应主要出现在 Math/Code 长轨迹。
+
+单测与短程 smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=. python tests/test_pv_opd.py
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=. python tests/test_opd_stage2.py
+
+# 正式 8 卡前，用短序列验证 DDP/显存/梯度；需要已有 Stage 1。
+MAX_LENGTH=256 DATASET_SIZE=16 \
+  bash scripts/run_qwen3_1.7b_pv_opd.sh \
+  --stage 2 --gpus 0,1 --max-steps 1 --save-steps 1
+```
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。

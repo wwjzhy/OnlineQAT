@@ -79,6 +79,7 @@ def _bare_trainer(**kwargs):
     obj.beta = kwargs.get("beta", 1.0)
     obj.temperature = kwargs.get("temperature", 1.0)
     obj.opd_mode = kwargs.get("opd_mode", True)
+    obj.pv_opd_mode = False
     obj.teacher_model = kwargs["teacher_model"]
     return obj
 

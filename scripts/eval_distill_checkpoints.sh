@@ -24,6 +24,8 @@ EVAL_GPU="${EVAL_GPU:-0}"
 POLL_SECS="${POLL_SECS:-30}"
 KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-0}"
 TAG=""
+STEPS=""
+SKIP_FINAL=0
 
 usage() {
   cat <<'EOF'
@@ -35,12 +37,15 @@ Options:
   --group-size N       Group size (default: 128)
   --eval-gpu ID        GPU for convert + vLLM (default: 0)
   --tag NAME           Eval/vLLM subdir name (default: basename of --watch-dir)
+  --steps CSV          Only eval these checkpoint steps, e.g. 25,50,75,100
+  --skip-final         Do not evaluate the final root checkpoint
   --poll-secs N        Sleep between scans (default: 30)
   -h, --help
 
 Environment:
   KEEP_CHECKPOINTS=1   Do not delete distill snapshots after eval
-  LIMIT, MAX_TOKENS, VLLM_PORT, ...  forwarded to eval_paper_benchmarks.sh
+  EVAL_DATASETS, LIMIT, MAX_TOKENS, VLLM_PORT, ...
+                       forwarded to eval_paper_benchmarks.sh
 EOF
 }
 
@@ -51,6 +56,8 @@ while [[ $# -gt 0 ]]; do
     --group-size) GROUP_SIZE="$2"; shift 2 ;;
     --eval-gpu) EVAL_GPU="$2"; shift 2 ;;
     --tag) TAG="$2"; shift 2 ;;
+    --steps) STEPS="${2// /}"; shift 2 ;;
+    --skip-final) SKIP_FINAL=1; shift ;;
     --poll-secs) POLL_SECS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -91,6 +98,12 @@ log() {
 
 ckpt_ready() {
   [[ -f "$1/config.json" && -f "$1/.ready" ]]
+}
+
+step_selected() {
+  local name="$1"
+  local step="${name#checkpoint-}"
+  [[ -z "${STEPS}" || ",${STEPS}," == *",${step},"* ]]
 }
 
 eval_one() {
@@ -160,13 +173,13 @@ pending() {
   local ckpt
   shopt -s nullglob
   for ckpt in "${WATCH_DIR}"/checkpoint-*; do
-    if [[ -d "${ckpt}" ]] && ckpt_ready "${ckpt}" && [[ ! -f "${ckpt}/.eval_done" ]]; then
+    if [[ -d "${ckpt}" ]] && step_selected "$(basename "${ckpt}")" && ckpt_ready "${ckpt}" && [[ ! -f "${ckpt}/.eval_done" ]]; then
       any=1
       break
     fi
   done
   shopt -u nullglob
-  if [[ -f "${WATCH_DIR}/.train_done" && -f "${WATCH_DIR}/config.json" && ! -f "${WATCH_DIR}/.eval_done" ]]; then
+  if [[ "${SKIP_FINAL}" -eq 0 && -f "${WATCH_DIR}/.train_done" && -f "${WATCH_DIR}/config.json" && ! -f "${WATCH_DIR}/.eval_done" ]]; then
     any=1
   fi
   echo "${any}"
@@ -175,13 +188,13 @@ pending() {
 while true; do
   shopt -s nullglob
   for ckpt in "${WATCH_DIR}"/checkpoint-*; do
-    if [[ -d "${ckpt}" ]] && ckpt_ready "${ckpt}"; then
+    if [[ -d "${ckpt}" ]] && step_selected "$(basename "${ckpt}")" && ckpt_ready "${ckpt}"; then
       eval_one "${ckpt}" "$(basename "${ckpt}")"
     fi
   done
   shopt -u nullglob
 
-  if [[ -f "${WATCH_DIR}/.train_done" && -f "${WATCH_DIR}/config.json" ]]; then
+  if [[ "${SKIP_FINAL}" -eq 0 && -f "${WATCH_DIR}/.train_done" && -f "${WATCH_DIR}/config.json" ]]; then
     if [[ ! -f "${WATCH_DIR}/.ready" ]]; then
       touch "${WATCH_DIR}/.ready"
     fi

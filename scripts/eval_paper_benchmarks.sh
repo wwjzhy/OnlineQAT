@@ -20,6 +20,7 @@
 #   GPU_UTIL            vLLM gpu-memory-utilization, default 0.9
 #   MAX_MODEL_LEN       default 32768
 #   EVAL_BATCH_SIZE     concurrent API requests, default 32
+#   EVAL_DATASETS       space-separated dataset override
 #   VLLM_API_URL        skip serve; eval against this OpenAI base (…/v1)
 #   SERVED_MODEL_NAME   must match vLLM --served-model-name if VLLM_API_URL is set
 set -euo pipefail
@@ -49,6 +50,10 @@ DATASETS=(
   gpqa_diamond
   ifeval
 )
+if [[ -n "${EVAL_DATASETS:-}" ]]; then
+  # shellcheck disable=SC2206
+  DATASETS=(${EVAL_DATASETS})
+fi
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "model not found: ${MODEL_PATH}" >&2

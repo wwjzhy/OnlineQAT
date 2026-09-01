@@ -27,7 +27,12 @@ from tqdm import tqdm
 import utils
 from pathlib import Path
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, TrainerCallback
-from quantize.int_linear_fake import load_quantized_model, opd_generate_context, resolve_attn_implementation
+from quantize.int_linear_fake import (
+    load_quantized_model,
+    opd_generate_context,
+    quantized_precision_view,
+    resolve_attn_implementation,
+)
 from accelerate import infer_auto_device_map, dispatch_model
 from trl import GKDConfig, GKDTrainer
 from trl.models.utils import unwrap_model_for_generation
@@ -44,6 +49,59 @@ from dataclasses import dataclass
 torch.backends.cudnn.benchmark = True
 
 from trl.trainer.utils import DataCollatorForChatML
+
+
+class ChunkedActionLogProbs(torch.autograd.Function):
+    """FP32 log-softmax with chunked backward recomputation.
+
+    Keeping every ``chunk.float()`` in the regular autograd graph retains an
+    entire FP32 vocabulary tensor. This function stores only the original
+    logits plus a sequence-sized log normalizer and recreates each softmax
+    chunk during backward.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels, temperature, vocab_chunk_size):
+        valid_mask = labels != -100
+        safe_labels = labels.masked_fill(~valid_mask, 0)
+        token_logits = logits.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1).float()
+        token_logits = token_logits / temperature
+
+        log_normalizer = None
+        for chunk in logits.split(vocab_chunk_size, dim=-1):
+            chunk_lse = torch.logsumexp(chunk.float() / temperature, dim=-1)
+            log_normalizer = (
+                chunk_lse
+                if log_normalizer is None
+                else torch.logaddexp(log_normalizer, chunk_lse)
+            )
+        ctx.temperature = temperature
+        ctx.vocab_chunk_size = vocab_chunk_size
+        ctx.save_for_backward(logits, safe_labels, valid_mask, log_normalizer)
+        return token_logits - log_normalizer
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, safe_labels, valid_mask, log_normalizer = ctx.saved_tensors
+        temperature = ctx.temperature
+        grad_output = grad_output.float() * valid_mask
+        grad_logits = torch.empty_like(logits)
+
+        start = 0
+        for chunk in logits.split(ctx.vocab_chunk_size, dim=-1):
+            width = chunk.shape[-1]
+            probabilities = torch.exp(
+                chunk.float() / temperature - log_normalizer.unsqueeze(-1)
+            )
+            chunk_grad = (
+                -grad_output.unsqueeze(-1) * probabilities / temperature
+            )
+            grad_logits[..., start : start + width] = chunk_grad.to(logits.dtype)
+            start += width
+
+        selected_grad = (grad_output / temperature).to(logits.dtype).unsqueeze(-1)
+        grad_logits.scatter_add_(-1, safe_labels.unsqueeze(-1), selected_grad)
+        return grad_logits, None, None, None
 
 
 def dft_cross_entropy(
@@ -108,7 +166,26 @@ def DFTCausalLMLoss(
     return loss
 
 class PolicyGKDTrainer(GKDTrainer):
-    def __init__(self, kl_weight=1.0, cross_entropy_weight=1.0, use_teacher_weight=False, use_dft_loss=False, top_k=None, kd_loss_type="jsd", mean_prob=0, beta=0.5, opd_mode=False, *args, **kwargs):
+    def __init__(
+        self,
+        kl_weight=1.0,
+        cross_entropy_weight=1.0,
+        use_teacher_weight=False,
+        use_dft_loss=False,
+        top_k=None,
+        kd_loss_type="jsd",
+        mean_prob=0,
+        beta=0.5,
+        opd_mode=False,
+        pv_opd_mode=False,
+        pv_probe_bits=4,
+        pv_gate_mode="full",
+        pv_gate_max=2.0,
+        pv_adv_clip=0.0,
+        pv_adv_clip_warmup_steps=10,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.kl_weight = kl_weight
         self.cross_entropy_weight = cross_entropy_weight
@@ -119,6 +196,16 @@ class PolicyGKDTrainer(GKDTrainer):
         self.mean_prob = mean_prob
         self.beta = beta
         self.opd_mode = opd_mode
+        self.pv_opd_mode = pv_opd_mode
+        self.pv_probe_bits = pv_probe_bits
+        self.pv_gate_mode = pv_gate_mode
+        self.pv_gate_max = pv_gate_max
+        self.pv_adv_clip = pv_adv_clip
+        self.pv_adv_clip_warmup_steps = pv_adv_clip_warmup_steps
+        self._pv_adv_clip_estimates = []
+        self._pv_adv_clip_value = pv_adv_clip if pv_adv_clip > 0 else None
+        self._pv_clip_last_step = None
+        self._pv_metrics_last_step = None
         # Keep teacher model on GPU - do not move to CPU to avoid memory leaks
         # Teacher model device should be managed by device_map during initialization
 
@@ -176,6 +263,185 @@ class PolicyGKDTrainer(GKDTrainer):
         # = E[(log pi_s(a) - log pi_t(a) + 1) grad log pi_s(a)].
         # The omitted +1 is a constant baseline with zero expected gradient.
         per_token_loss = sampled_reverse_kl * student_log_probs
+        return per_token_loss[valid_mask].sum() / valid_mask.sum().clamp_min(1)
+
+    @staticmethod
+    def sampled_action_log_probs(
+        logits, labels, temperature=1.0, vocab_chunk_size=16384
+    ):
+        """FP32 action log-probs without a full-vocabulary FP32 copy."""
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        if torch.is_grad_enabled() and logits.requires_grad:
+            return ChunkedActionLogProbs.apply(
+                logits, labels, float(temperature), int(vocab_chunk_size)
+            )
+        valid_mask = labels != -100
+        safe_labels = labels.masked_fill(~valid_mask, 0).unsqueeze(-1)
+        token_logits = logits.gather(-1, safe_labels).squeeze(-1).float()
+        if temperature != 1.0:
+            token_logits = token_logits / temperature
+
+        log_normalizer = None
+        for chunk in logits.split(vocab_chunk_size, dim=-1):
+            chunk_fp32 = chunk.float()
+            if temperature != 1.0:
+                chunk_fp32 = chunk_fp32 / temperature
+            chunk_lse = torch.logsumexp(chunk_fp32, dim=-1)
+            log_normalizer = (
+                chunk_lse
+                if log_normalizer is None
+                else torch.logaddexp(log_normalizer, chunk_lse)
+            )
+        return token_logits - log_normalizer
+
+    @staticmethod
+    def build_precision_gate(
+        a_fp,
+        a_prec,
+        valid_mask,
+        gate_mode="full",
+        gate_max=2.0,
+        eps=1e-6,
+    ):
+        """Build the detached PV gate and normalize its valid-token mean."""
+        if gate_mode not in {"full", "sign", "shuffled"}:
+            raise ValueError(f"unsupported PV gate mode: {gate_mode}")
+        same_direction = (a_fp * a_prec) > 0
+        gate = same_direction.to(torch.float32)
+        if gate_mode in {"full", "shuffled"}:
+            recovery = (a_prec.abs() / (a_fp.abs() + eps)).clamp(max=1.0)
+            gate = gate * recovery
+        gate = gate * valid_mask
+
+        gate_sum = gate.sum()
+        gate_count = valid_mask.sum().to(gate.dtype)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            stats = torch.stack([gate_sum, gate_count])
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            gate_sum, gate_count = stats[0], stats[1]
+        gate_mean = gate_sum / gate_count.clamp_min(1.0)
+        gate = (gate / (gate_mean + eps)).clamp(max=gate_max) * valid_mask
+
+        if gate_mode == "shuffled":
+            shuffled = gate[valid_mask]
+            if shuffled.numel() > 1:
+                shuffled = shuffled[torch.randperm(shuffled.numel(), device=gate.device)]
+                gate = gate.clone()
+                gate[valid_mask] = shuffled
+        return gate.detach(), same_direction & valid_mask
+
+    def _update_pv_adv_clip(self, a_fp, valid_mask):
+        if self.pv_adv_clip > 0:
+            return float(self.pv_adv_clip)
+        step = int(getattr(self.state, "global_step", 0))
+        valid_abs = a_fp.detach().abs()[valid_mask]
+        if valid_abs.numel() == 0:
+            return self._pv_adv_clip_value or 1.0
+        if (
+            self._pv_adv_clip_value is None
+            or step < self.pv_adv_clip_warmup_steps
+        ) and self._pv_clip_last_step != step:
+            estimate = torch.quantile(valid_abs.float(), 0.99)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    estimate, op=torch.distributed.ReduceOp.SUM
+                )
+                estimate /= torch.distributed.get_world_size()
+            self._pv_adv_clip_estimates.append(float(estimate.clamp_min(1e-6).cpu()))
+            self._pv_adv_clip_value = sum(self._pv_adv_clip_estimates) / len(
+                self._pv_adv_clip_estimates
+            )
+            self._pv_clip_last_step = step
+        return self._pv_adv_clip_value or 1.0
+
+    def _log_pv_metrics(
+        self, labels, a_fp, a_prec, gate, same_direction, valid_mask, adv_clip
+    ):
+        step = int(getattr(self.state, "global_step", 0))
+        if self._pv_metrics_last_step == step:
+            return
+        self._pv_metrics_last_step = step
+
+        def masked_mean(value, mask=valid_mask):
+            selected = value[mask]
+            return float(selected.float().mean().detach().cpu()) if selected.numel() else 0.0
+
+        metrics = {
+            "pv/gate_mean": masked_mean(gate),
+            "pv/gate_keep_rate": masked_mean((gate > 0).float()),
+            "pv/same_direction_rate": masked_mean(same_direction.float()),
+            "pv/a_fp_abs": masked_mean(a_fp.abs()),
+            "pv/a_prec_abs": masked_mean(a_prec.abs()),
+            "pv/adv_clip": float(adv_clip),
+        }
+
+        # The on-policy sampled reverse gap is a Monte Carlo KL estimate.
+        positions = valid_mask.long().cumsum(dim=-1) - 1
+        lengths = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        quartile = (4 * positions / lengths).long().clamp(0, 3)
+        reverse_gap = -a_fp
+        for index in range(4):
+            pos_mask = valid_mask & (quartile == index)
+            metrics[f"pv/sampled_kl_pos_q{index + 1}"] = masked_mean(
+                reverse_gap, pos_mask
+            )
+
+        token_ids = labels[valid_mask].detach().cpu().tolist()
+        token_strings = self.processing_class.convert_ids_to_tokens(token_ids)
+        categories = {"number": [], "operator": [], "code": [], "text": []}
+        valid_gate = gate[valid_mask].detach().float().cpu().tolist()
+        operator_chars = set("+-*/%=<>")
+        code_chars = set("{}[]();:_.,\\|&^~")
+        for token, value in zip(token_strings, valid_gate):
+            token = str(token)
+            if any(char.isdigit() for char in token):
+                category = "number"
+            elif any(char in operator_chars for char in token):
+                category = "operator"
+            elif any(char in code_chars for char in token):
+                category = "code"
+            else:
+                category = "text"
+            categories[category].append(value)
+        for category, values in categories.items():
+            metrics[f"pv/gate_{category}"] = (
+                sum(values) / len(values) if values else 0.0
+            )
+        self.log(metrics)
+
+    def precision_verified_policy_loss(
+        self,
+        student_logp,
+        teacher_logp,
+        probe_logp,
+        labels,
+    ):
+        """Current sampled reverse-KL surrogate weighted by the PV gate."""
+        valid_mask = labels != -100
+        with torch.no_grad():
+            detached_student = student_logp.detach()
+            a_fp = teacher_logp.detach() - detached_student
+            a_prec = probe_logp.detach() - detached_student
+            gate, same_direction = self.build_precision_gate(
+                a_fp,
+                a_prec,
+                valid_mask,
+                gate_mode=self.pv_gate_mode,
+                gate_max=self.pv_gate_max,
+            )
+            adv_clip = self._update_pv_adv_clip(a_fp, valid_mask)
+            reverse_advantage = (-a_fp).clamp(-adv_clip, adv_clip)
+            self._log_pv_metrics(
+                labels,
+                a_fp,
+                a_prec,
+                gate,
+                same_direction,
+                valid_mask,
+                adv_clip,
+            )
+        per_token_loss = gate * reverse_advantage * student_logp
         return per_token_loss[valid_mask].sum() / valid_mask.sum().clamp_min(1)
 
     @staticmethod
@@ -387,7 +653,49 @@ class PolicyGKDTrainer(GKDTrainer):
 
         # KL divergence loss
         if self.kl_weight > 0.0:
-            if self.opd_mode:
+            if self.pv_opd_mode:
+                student_logp = self.sampled_action_log_probs(
+                    shifted_student_logits,
+                    shifted_labels,
+                    temperature=self.temperature,
+                )
+                with torch.no_grad():
+                    teacher_logp = self.sampled_action_log_probs(
+                        shifted_teacher_logits,
+                        shifted_labels,
+                        temperature=self.temperature,
+                    )
+                # Free the teacher vocabulary logits before materializing the
+                # W4 probe logits. The student graph remains for backward.
+                del shifted_teacher_logits
+                shifted_teacher_logits = None
+                probe_model = (
+                    self.accelerator.unwrap_model(model)
+                    if hasattr(self, "accelerator")
+                    else model
+                )
+                with torch.no_grad(), quantized_precision_view(
+                    probe_model, self.pv_probe_bits
+                ):
+                    probe_outputs = probe_model(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        use_cache=False,
+                    )
+                    probe_logp = self.sampled_action_log_probs(
+                        probe_outputs.logits[:, :-1, :],
+                        shifted_labels,
+                        temperature=self.temperature,
+                    )
+                del probe_outputs
+                kl_loss = self.precision_verified_policy_loss(
+                    student_logp=student_logp,
+                    teacher_logp=teacher_logp,
+                    probe_logp=probe_logp,
+                    labels=shifted_labels,
+                )
+                del student_logp, teacher_logp, probe_logp
+            elif self.opd_mode:
                 kl_loss = self.sampled_reverse_kl_policy_loss(
                     student_logits=shifted_student_logits,
                     teacher_logits=shifted_teacher_logits,
@@ -442,7 +750,8 @@ class PolicyGKDTrainer(GKDTrainer):
 
         # Delete intermediate tensors after all computations to free memory
         del shifted_student_logits
-        del shifted_teacher_logits
+        if shifted_teacher_logits is not None:
+            del shifted_teacher_logits
         del shifted_labels
 
         if need_ce:
@@ -740,6 +1049,31 @@ def apply_chat_template(example, tokenizer):
     # messages.insert(0, {"role": "system", "content": "You are a helpful assistant."})
     return {'messages': messages}
 
+
+def validate_pv_trainable_scope(model):
+    """Fail fast unless PV-OPD updates full weights plus clipping scales."""
+    counts = {"master_weight": 0, "scale": 0, "other": 0}
+    forbidden = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if "zero_point" in name or "embed_tokens" in name:
+            forbidden.append(name)
+        if "weight_quantizer.scale" in name:
+            counts["scale"] += parameter.numel()
+        elif name.endswith(".weight"):
+            counts["master_weight"] += parameter.numel()
+        else:
+            counts["other"] += parameter.numel()
+    if forbidden:
+        raise ValueError(f"PV-OPD forbidden trainable parameters: {forbidden[:5]}")
+    if counts["master_weight"] == 0 or counts["scale"] == 0:
+        raise ValueError(
+            "PV-OPD FullPair requires trainable master weights and quantizer scales"
+        )
+    return counts
+
+
 def main():
     import argparse
 
@@ -782,6 +1116,12 @@ def main():
 
     parser.add_argument("--kd_loss_type", type=str, default="jsd", choices=["jsd", "cakld", "forward_kl"], help="Knowledge distillation loss type: 'jsd' for generalized_jsd_loss, 'cakld' for cakld_loss, 'forward_kl' for OPD KL(teacher||student)")
     parser.add_argument("--opd", action="store_true", help="On-policy distillation: student rollouts + sampled reverse-KL policy gradient, matching slime OPD.")
+    parser.add_argument("--pv_opd", action="store_true", help="PV-OPD FullPair: gate sampled reverse-KL with a shared-range precision probe.")
+    parser.add_argument("--pv_probe_bits", type=int, default=4, help="Precision-probe bitwidth for PV-OPD.")
+    parser.add_argument("--pv_gate_mode", choices=["full", "sign", "shuffled"], default="full", help="PV gate or gate ablation.")
+    parser.add_argument("--pv_gate_max", type=float, default=2.0, help="Maximum normalized PV gate.")
+    parser.add_argument("--pv_adv_clip", type=float, default=0.0, help="Fixed |A_FP| clip; 0 calibrates from warmup P99.")
+    parser.add_argument("--pv_adv_clip_warmup_steps", type=int, default=10, help="Steps used to calibrate |A_FP| P99.")
     parser.add_argument("--cakld_steps", type=int, default=100, help="Number of steps to calculate mean probability for CAKLD loss")
     parser.add_argument("--enable_efficient_qat", action="store_true", help="Enable efficient QAT mode: only train scale parameters, freeze all other parameters")
 
@@ -793,6 +1133,21 @@ def main():
     device = torch.device("cuda", local_rank)
     # device name print
     args = parser.parse_args()
+    if args.opd and args.pv_opd:
+        parser.error("--opd and --pv_opd are mutually exclusive")
+    if args.pv_opd and args.enable_efficient_qat:
+        parser.error("PV-OPD FullPair cannot use --enable_efficient_qat")
+    if args.pv_opd and args.pv_probe_bits <= args.wbits:
+        parser.error("--pv_probe_bits must be greater than --wbits")
+    if args.pv_opd and (
+        args.cross_entropy_weight != 0.0
+        or args.use_dft_loss
+        or args.use_teacher_weight
+    ):
+        parser.error(
+            "PV-OPD requires --cross_entropy_weight 0 and no auxiliary CE loss"
+        )
+    on_policy_mode = args.opd or args.pv_opd
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -816,7 +1171,7 @@ def main():
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         max_length=args.max_length,
-        max_new_tokens=opd_gen_tokens if args.opd else 128,
+        max_new_tokens=opd_gen_tokens if on_policy_mode else 128,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,  # More optimal for AdamW fine-tuning
@@ -827,7 +1182,7 @@ def main():
         save_strategy="no",
         gradient_checkpointing=True,
         seq_kd=False, # enforce supervised KD
-        lmbda=1.0 if args.opd else 0.0,
+        lmbda=1.0 if on_policy_mode else 0.0,
         temperature=0.6,
         logging_steps=1,
         warmup_ratio=0.2,   # Added warmup to stabilize training
@@ -902,6 +1257,9 @@ def main():
                 param.requires_grad = True
             if 'scale' in name:
                 scale_param_grad_hook(param, name)
+    if args.pv_opd:
+        trainable_counts = validate_pv_trainable_scope(model)
+        logger.info(f"PV-OPD FullPair trainable parameter counts: {trainable_counts}")
 
     # replace first layer into the ternary
     dev = model.device
@@ -1064,7 +1422,13 @@ def main():
         top_k=args.top_k,
         kd_loss_type=args.kd_loss_type,
         mean_prob=mean_prob,
-        opd_mode=args.opd,
+        opd_mode=on_policy_mode,
+        pv_opd_mode=args.pv_opd,
+        pv_probe_bits=args.pv_probe_bits,
+        pv_gate_mode=args.pv_gate_mode,
+        pv_gate_max=args.pv_gate_max,
+        pv_adv_clip=args.pv_adv_clip,
+        pv_adv_clip_warmup_steps=args.pv_adv_clip_warmup_steps,
         model=model,
         teacher_model=teacher_model,
         processing_class=tokenizer,
@@ -1074,15 +1438,17 @@ def main():
         callbacks=callbacks or None,
         # optimizers=(optimizer, None),
     )
-    if args.opd:
+    if on_policy_mode:
         # Cap prompt+rollout at the same sequence budget as GKD (collator max_length).
         # Do not set max_new_tokens=8192: that would allow prompt_len + 8192 > GKD's 8192.
         trainer.generation_config.max_new_tokens = None
         trainer.generation_config.max_length = args.max_length or 8192
         trainer.generation_config.use_cache = True
         logger.info(
-            f"OPD enabled: student rollout lmbda=1 max_length={trainer.generation_config.max_length} "
-            f"kd_loss_type={args.kd_loss_type} top_k={args.top_k} ce_weight={args.cross_entropy_weight}"
+            f"{'PV-OPD' if args.pv_opd else 'OPD'} enabled: student rollout lmbda=1 "
+            f"max_length={trainer.generation_config.max_length} kd_loss_type={args.kd_loss_type} "
+            f"top_k={args.top_k} ce_weight={args.cross_entropy_weight} "
+            f"probe_bits={args.pv_probe_bits if args.pv_opd else 'none'}"
         )
 
     if trainer.is_world_process_zero():

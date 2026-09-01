@@ -84,6 +84,46 @@ class UniformAffineQuantizer(nn.Module):
         self.n_bits = n_bits
         self.qmin = 0
         self.qmax = int(2 ** (n_bits) - 1)
+
+    def fake_quant_at_bits(self, x, n_bits):
+        """Quantize with another grid while preserving this quantizer's range.
+
+        The learnable target-bit ``scale`` and frozen integer ``zero_point``
+        define real clipping endpoints.  A precision probe reuses those
+        endpoints and only increases the number of codewords.  In particular,
+        W2 -> W4 is nested exactly because 15 / 3 is integral.
+        """
+        if not 2 <= n_bits <= 16:
+            raise ValueError(f"bitwidth not supported: {n_bits}")
+        if n_bits == self.n_bits:
+            return self.fake_quant(x)
+        if n_bits >= 16:
+            return x
+
+        target_scale = clamp_ste(
+            gradscale(self.scale, self.grad_scale).abs(), CLIPMIN, 1e4
+        )
+        target_zero_point = clamp_ste(
+            round_ste(self.zero_point), self.qmin, self.qmax
+        )
+        probe_qmin = 0
+        probe_qmax = int(2**n_bits - 1)
+
+        # Preserve [(-zp)*scale, (qmax-zp)*scale].  Do not independently
+        # initialize probe parameters; it is a view of the target quantizer.
+        clipping_min = (self.qmin - target_zero_point) * target_scale
+        clipping_range = (self.qmax - self.qmin) * target_scale
+        probe_scale = (clipping_range / (probe_qmax - probe_qmin)).clamp_min(1e-8)
+        probe_zero_point = (
+            probe_qmin - clipping_min / probe_scale
+        ).round().clamp(probe_qmin, probe_qmax)
+
+        dim1, dim2 = x.shape
+        grouped = x.reshape(-1, self.group_size)
+        x_int = round_ste(grouped / probe_scale + probe_zero_point)
+        x_int = x_int.clamp(probe_qmin, probe_qmax)
+        x_dequant = (x_int - probe_zero_point) * probe_scale
+        return x_dequant.reshape(dim1, dim2)
         
     def fake_quant(self, x):
         # print(f"[DEBUG] Input x: min={x.min().item():.6f}, max={x.max().item():.6f}")

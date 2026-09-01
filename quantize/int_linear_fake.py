@@ -78,6 +78,7 @@ class QuantLinear(nn.Module):
         self.weight_quantizer = self._create_quantizer(quantizer_class, wbits, group_size, org_module.weight, **quantizer_kwargs)
         self.use_temporary_parameter = False
         self._cached_weight = None
+        self._precision_view_bits = None
         # self.output_scale = nn.Parameter([2.0], dtype=self.weight.dtype, device=self.weight.device)
 
     def _create_quantizer(self, quantizer_class, wbits, group_size, weight, **kwargs):
@@ -99,12 +100,23 @@ class QuantLinear(nn.Module):
             return UniformAffineQuantizer(wbits, group_size, weight=weight, **kwargs)
 
     
+    def quantized_weight(self):
+        if self._precision_view_bits is not None:
+            if not hasattr(self.weight_quantizer, "fake_quant_at_bits"):
+                raise TypeError(
+                    f"{type(self.weight_quantizer).__name__} does not support precision probes"
+                )
+            return self.weight_quantizer.fake_quant_at_bits(
+                self.weight, self._precision_view_bits
+            )
+        return self.weight_quantizer(self.weight)
+
     def forward(self, input: torch.Tensor):
         if self._cached_weight is not None:
             weight = self._cached_weight
             bias = self.bias
         elif self.use_weight_quant:
-            weight = self.weight_quantizer(self.weight)
+            weight = self.quantized_weight()
             bias = self.bias
         else:
             weight = self.weight
@@ -116,7 +128,7 @@ class QuantLinear(nn.Module):
         """Snapshot fake-quant weights. Valid while master weights are frozen (generate)."""
         if self.use_weight_quant:
             with torch.no_grad():
-                self._cached_weight = self.weight_quantizer(self.weight)
+                self._cached_weight = self.quantized_weight()
         else:
             self._cached_weight = None
 
@@ -126,6 +138,22 @@ class QuantLinear(nn.Module):
     def set_quant_state(self, weight_quant: bool = False):
         self.use_weight_quant = weight_quant
         self.clear_quantized_weight_cache()
+
+
+@contextmanager
+def quantized_precision_view(model, n_bits):
+    """Temporarily evaluate all QuantLinear modules on a shared-range grid."""
+    modules = [m for m in model.modules() if isinstance(m, QuantLinear)]
+    previous = [m._precision_view_bits for m in modules]
+    try:
+        for module in modules:
+            module.clear_quantized_weight_cache()
+            module._precision_view_bits = n_bits
+        yield model
+    finally:
+        for module, old_bits in zip(modules, previous):
+            module.clear_quantized_weight_cache()
+            module._precision_view_bits = old_bits
 
 
 @contextmanager
@@ -218,5 +246,5 @@ def load_quantized_model(model_path, wbits, group_size, replace=False, strict=Fa
 
     return model, tokenizer
 
-__all__ = ["QuantLinear"]
+__all__ = ["QuantLinear", "quantized_precision_view"]
 
