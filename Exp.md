@@ -394,6 +394,110 @@ MAX_LENGTH=256 DATASET_SIZE=16 \
 
 ---
 
+## Exp #7（2026-09-04 新增）— W2-OPD，学习率降到 `1e-6`
+
+**要求：** 和 Exp #5 同一设定（读 `#4` Stage 1 的 `w2g128`，student rollout + sampled reverse KL，CE=0，8 卡，effective batch 64，每 5 step 存 ckpt），**只改两处：学习率 `5e-6` → `1e-6`，最多 optimizer step `100` → `50`**。用来检验默认 W2-OPD 的评测振荡 / code-jump 是否主要是步长过大。不要 `--train-emb`，不要重训 Stage 1。
+
+产出目录必须和 `#5` 分开：脚本在非默认 LR 时自动加后缀 `-lr1e-6`，写成 `Qwen3-1.7B-w2g128-opd-lr1e-6`，**不要覆盖** `#5` 的 `w2g128-opd`。
+
+| | Exp #5 | Exp #7 |
+|--|--|--|
+| Stage 1 | `#4` 的 `w2g128` | **同一份** |
+| Loss | sampled reverse KL | 相同 |
+| LR | **`5e-6`（W2 默认）** | **`1e-6`** |
+| max / save steps | **100 / 5** | **50 / 5** |
+| 产出后缀 | `w2g128-opd` | `w2g128-opd-lr1e-6` |
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`（Exp #4 Stage 1）。没有就等 `#4`，不要在本实验重跑 Stage 1。
+
+**状态：** 未跑。脚本已支持 `--lr`；非默认 LR 会改产出目录名。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+# 相对 #5：--lr 1e-6，且只跑 50 step
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 50 --save-steps 5 \
+  --lr 1e-6
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/Qwen3-1.7B-w2g128-opd-lr1e-6 \
+  --wbits 2 --eval-gpu 0 \
+  --steps 5,10,15,20,25,35,50 --skip-final
+```
+
+看训练时确认横幅是 `lr=1e-6`，产出是 `*-opd-lr1e-6` 而不是 `*-opd`。
+
+产出：
+
+```
+output/distill/Qwen3-1.7B-w2g128-opd-lr1e-6
+output/eval/Qwen3-1.7B-w2g128-opd-lr1e-6/checkpoint-{5,...,50}
+log/distill/Qwen3-1.7B-w2g128-opd-lr1e-6
+```
+
+和 `#5`（`5e-6`）对比前 50 step：GSM8K 是否还出现 25→0.5 断崖、`grad_norm` 尖峰、code-jump ratio 是否明显下降。若 `1e-6` 稳住，则默认崩主要是步长问题，而不是 OPD 接线错误。
+
+---
+
+## Exp #8（2026-09-04 新增）— W2-OPD，主 LR `2e-6` + 30 step warmup（起始 `2e-7`）
+
+**要求：** 仍读 Exp #4 Stage 1 的 `w2g128`，其余与 `#5/#7` 相同（student rollout + sampled reverse KL，CE=0，8 卡，effective batch 64，**最多 50 step**，每 5 step 存 ckpt）。相对默认 W2-OPD，改学习率日程：
+
+| 项 | 默认 `#5` | 本实验 `#8` |
+|--|--|--|
+| 峰值 / 主文目标 LR | `5e-6` | **`2e-6`** |
+| Warmup | `warmup_ratio=0.2`（约 10/50 step，从 0 升） | **固定前 30 optimizer step** |
+| Warmup 起始 LR | 0 | **`2e-7`** |
+| 产出后缀 | `w2g128-opd` | `w2g128-opd-lr2e-6-wu30-ws2e-7` |
+
+不要 `--train-emb`，不要重训 Stage 1。用来对照「恒定小 LR（#7）」vs「略高峰值但长 warmup、非零起点（本实验）」对 code-jump / 评测振荡的影响。
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`（Exp #4 Stage 1）。
+
+**状态：** 未跑。脚本已支持 `--warmup-steps` / `--warmup-start-lr`。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 50 --save-steps 5 \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7 \
+  --wbits 2 --eval-gpu 0 \
+  --steps 5,10,15,20,25,35,50 --skip-final
+```
+
+训练横幅应看到 `lr=2e-6`、`warmup_steps=30`、`warmup_start_lr=2e-7`。注意：50 step 里有 30 step 在 warmup，峰值 LR 段只有约 20 step。
+
+产出：
+
+```
+output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7
+output/eval/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7/checkpoint-{5,...,50}
+log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7
+```
+
+和 `#5`（`5e-6`）/ `#7`（`1e-6`）对比 GSM8K 曲线、`grad_norm`、code-jump。
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。

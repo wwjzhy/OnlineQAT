@@ -27,6 +27,10 @@ SKIP_EXISTING=0
 SAVE_STEPS="${SAVE_STEPS:-0}"
 EVAL_GPU="${EVAL_GPU:-}"
 MAX_STEPS="${MAX_STEPS:-0}"
+# Empty = use the bitwidth default below. Exp #7 overrides with --lr 1e-6.
+DISTILL_LR_OVERRIDE=""
+WARMUP_STEPS=""
+WARMUP_START_LR=""
 
 MODEL="${MODEL_PATH:-/zju_0038/zq/models/Qwen3-1.7B}"
 TEACHER="${TEACHER_MODEL:-${MODEL}}"
@@ -65,10 +69,14 @@ Options:
   --skip-existing        Skip a stage if its output dir already has config.json
   --save-steps N         Save a convert-ready snapshot every N Stage 2 steps (0=off)
   --max-steps N          Cap Stage 2 optimizer steps (0=use epochs; Exp #5 uses 100)
+  --lr RATE              Stage 2 learning rate (default: 5e-6 for W2, 1e-6 for W3)
+  --warmup-steps N       Fixed warmup steps (default: warmup_ratio=0.2)
+  --warmup-start-lr RATE LR at step 0 during warmup (default: 0)
   --eval-gpu ID          GPU for convert+evalscope watcher (requires --save-steps > 0)
   -h, --help             Show this help
 
 Environment overrides: same as scripts/run_qwen3_1.7b.sh
+  DISTILL_LR             Same as --lr if the flag is omitted
 EOF
 }
 
@@ -84,6 +92,9 @@ while [[ $# -gt 0 ]]; do
     --skip-existing) SKIP_EXISTING=1; shift ;;
     --save-steps) SAVE_STEPS="$2"; shift 2 ;;
     --max-steps) MAX_STEPS="$2"; shift 2 ;;
+    --lr) DISTILL_LR_OVERRIDE="$2"; shift 2 ;;
+    --warmup-steps) WARMUP_STEPS="$2"; shift 2 ;;
+    --warmup-start-lr) WARMUP_START_LR="$2"; shift 2 ;;
     --eval-gpu) EVAL_GPU="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -104,17 +115,37 @@ if [[ ! -f "${MODEL}/config.json" ]]; then
 fi
 
 if [[ "${WBITS}" == "2" ]]; then
-  DISTILL_LR="5e-6"
+  DEFAULT_DISTILL_LR="5e-6"
   DISTILL_EPOCHS=3
 else
-  DISTILL_LR="1e-6"
+  DEFAULT_DISTILL_LR="1e-6"
   DISTILL_EPOCHS=1
+fi
+# Flag wins over env; env wins over bitwidth default.
+if [[ -n "${DISTILL_LR_OVERRIDE}" ]]; then
+  DISTILL_LR="${DISTILL_LR_OVERRIDE}"
+elif [[ -n "${DISTILL_LR:-}" ]]; then
+  :
+else
+  DISTILL_LR="${DEFAULT_DISTILL_LR}"
 fi
 
 EXP_NAME="Qwen3-1.7B-w${WBITS}g${GROUP_SIZE}"
 DISTILL_TAG="${EXP_NAME}-opd"
 if [[ "${TRAIN_EMB}" -eq 1 ]]; then
   DISTILL_TAG="${EXP_NAME}-trainemb-opd"
+fi
+# Non-default LR gets its own output dir so Exp #5 (5e-6) is not overwritten.
+if [[ "${DISTILL_LR}" != "${DEFAULT_DISTILL_LR}" ]]; then
+  LR_TAG="$(printf '%s' "${DISTILL_LR}" | tr '[:upper:]' '[:lower:]' | sed 's/[.]/_/g')"
+  DISTILL_TAG="${DISTILL_TAG}-lr${LR_TAG}"
+fi
+if [[ -n "${WARMUP_STEPS}" ]]; then
+  DISTILL_TAG="${DISTILL_TAG}-wu${WARMUP_STEPS}"
+fi
+if [[ -n "${WARMUP_START_LR}" ]]; then
+  WS_TAG="$(printf '%s' "${WARMUP_START_LR}" | tr '[:upper:]' '[:lower:]' | sed 's/[.]/_/g')"
+  DISTILL_TAG="${DISTILL_TAG}-ws${WS_TAG}"
 fi
 
 BLOCK_DIR="${ROOT}/output/block_qat/${EXP_NAME}"
@@ -185,6 +216,14 @@ if [[ "${MAX_STEPS}" -gt 0 ]]; then
   MAX_STEPS_FLAG="--max_steps ${MAX_STEPS}"
 fi
 
+WARMUP_FLAGS=()
+if [[ -n "${WARMUP_STEPS}" ]]; then
+  WARMUP_FLAGS+=(--warmup_steps "${WARMUP_STEPS}")
+fi
+if [[ -n "${WARMUP_START_LR}" ]]; then
+  WARMUP_FLAGS+=(--warmup_start_lr "${WARMUP_START_LR}")
+fi
+
 if [[ -n "${EVAL_GPU}" ]]; then
   case ",${DISTILL_GPUS}," in
     *",${EVAL_GPU},"*)
@@ -206,6 +245,7 @@ echo "  teacher=${TEACHER}"
 echo "  python=${PY}"
 echo "Stage 2 GPUs: ${DISTILL_GPUS}  (${N_DISTILL_GPUS} GPU, accum=${GRAD_ACCUM}, effective_batch=${EFFECTIVE_BATCH}, max_length=${MAX_LENGTH})"
 echo "  student generate then sampled reverse-KL policy gradient; no CE"
+echo "  lr=${DISTILL_LR} (default ${DEFAULT_DISTILL_LR})  warmup_steps=${WARMUP_STEPS:-ratio0.2}  warmup_start_lr=${WARMUP_START_LR:-0}"
 echo "  save_steps=${SAVE_STEPS}  max_steps=${MAX_STEPS:-epochs}  eval_gpu=${EVAL_GPU:-none}"
 echo "Stage 3 GPU : ${CONVERT_GPU}"
 echo "Inputs / outputs:"
@@ -271,6 +311,7 @@ if run_stage 2; then
       ${TRAIN_EMB_FLAG} \
       ${SAVE_STEPS_FLAG} \
       ${MAX_STEPS_FLAG} \
+      ${WARMUP_FLAGS[@]+"${WARMUP_FLAGS[@]}"} \
       --save_quant_dir "${DISTILL_DIR}" \
       --output_dir "${DISTILL_LOG}"
     touch "${DISTILL_DIR}/.ready" "${DISTILL_DIR}/.train_done"

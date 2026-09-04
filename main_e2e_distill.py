@@ -504,6 +504,35 @@ class PolicyGKDTrainer(GKDTrainer):
             return super(GKDTrainer, self).training_step(model, inputs, num_items_in_batch)
         return super().training_step(model, inputs, num_items_in_batch)
 
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        """Linear warmup from ``warmup_start_lr`` (default 0) to ``learning_rate``."""
+        if optimizer is None:
+            optimizer = self.optimizer
+        warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
+        start_lr = float(getattr(self, "warmup_start_lr", 0.0) or 0.0)
+        peak_lr = float(self.args.learning_rate)
+        if warmup_steps <= 0 or start_lr <= 0.0 or peak_lr <= 0.0:
+            return super().create_scheduler(num_training_steps, optimizer=optimizer)
+
+        start_factor = min(1.0, start_lr / peak_lr)
+
+        def lr_lambda(current_step: int):
+            if current_step < warmup_steps:
+                progress = float(current_step) / float(max(1, warmup_steps))
+                return start_factor + (1.0 - start_factor) * progress
+            # Match HF linear schedule after warmup: decay to 0 by num_training_steps.
+            return max(
+                0.0,
+                float(num_training_steps - current_step)
+                / float(max(1, num_training_steps - warmup_steps)),
+            )
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+        self._created_lr_scheduler = True
+        return self.lr_scheduler
+
     @staticmethod
     def cakld_loss(student_logits, teacher_logits, labels=None, beta_prob=0.5):
         mask = (labels != -100)
@@ -1099,6 +1128,8 @@ def main():
     parser.add_argument("--max_memory", type=str, default="70GiB",help="The maximum memory of each GPU")
     parser.add_argument("--quantizer_class", type=str, default="UniformAffineQuantizer", help="quantizer class to use (e.g., UniformAffineQuantizer, LogQuantizer)")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=-1, help="Linear warmup steps; -1 keeps warmup_ratio=0.2")
+    parser.add_argument("--warmup_start_lr", type=float, default=0.0, help="LR at step 0 when warmup_steps>0; 0 starts from 0")
     parser.add_argument("--optim", type=str, default="adamw_torch", help="optimizer")
     parser.add_argument("--max_length", type=int, default=None, help="maximum sequence length")
     parser.add_argument("--per_device_train_batch_size", type=int, default=1, help="per device train batch size")
@@ -1166,6 +1197,7 @@ def main():
     # GKD paper run: lmbda=0 offline JSD on dataset completions.
     # OPD: lmbda=1 student rollouts; max_new_tokens matches max_length budget.
     opd_gen_tokens = args.max_length if args.max_length else 8192
+    use_fixed_warmup = args.warmup_steps is not None and args.warmup_steps >= 0
     training_args = GKDConfig(
         beta=1.0, # KL(student || teacher)
         num_train_epochs=args.epochs,
@@ -1185,7 +1217,8 @@ def main():
         lmbda=1.0 if on_policy_mode else 0.0,
         temperature=0.6,
         logging_steps=1,
-        warmup_ratio=0.2,   # Added warmup to stabilize training
+        warmup_steps=args.warmup_steps if use_fixed_warmup else 0,
+        warmup_ratio=0.0 if use_fixed_warmup else 0.2,
         max_grad_norm=0.5,  # Reduced from 1.0 for more aggressive gradient clipping
         bf16=True,
         # fp16=False,
@@ -1438,6 +1471,12 @@ def main():
         callbacks=callbacks or None,
         # optimizers=(optimizer, None),
     )
+    trainer.warmup_start_lr = float(args.warmup_start_lr)
+    if use_fixed_warmup:
+        logger.info(
+            f"warmup_steps={args.warmup_steps} warmup_start_lr={args.warmup_start_lr} "
+            f"peak_lr={args.learning_rate}"
+        )
     if on_policy_mode:
         # Cap prompt+rollout at the same sequence budget as GKD (collator max_length).
         # Do not set max_new_tokens=8192: that would allow prompt_len + 8192 > GKD's 8192.

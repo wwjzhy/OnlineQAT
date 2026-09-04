@@ -267,6 +267,9 @@ def test_scripts_gkd_vs_opd_flags():
     assert "-opd" in opd
     assert "--save-steps" in opd
     assert "--max-steps" in opd
+    assert "--lr" in opd
+    assert "--warmup-steps" in opd
+    assert "--warmup-start-lr" in opd
     assert "eval_distill_checkpoints.sh" in opd
 
 
