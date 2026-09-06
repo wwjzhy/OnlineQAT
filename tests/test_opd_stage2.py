@@ -271,7 +271,17 @@ def test_scripts_gkd_vs_opd_flags():
     assert "--lr" in opd
     assert "--warmup-steps" in opd
     assert "--warmup-start-lr" in opd
+    assert "--lr-scheduler" in opd
+    assert "--resume" in opd
+    assert "--resume-from" in opd
+    assert "--init-from" in opd
+    assert "--run-suffix" in opd
     assert "eval_distill_checkpoints.sh" in opd
+    src = (ROOT / "main_e2e_distill.py").read_text()
+    assert "resume_from_checkpoint=last_checkpoint" in src
+    assert "enable_trainer_ckpt" in src
+    assert 'save_strategy="steps" if enable_trainer_ckpt else "no"' in src
+    assert "elif args.resume:" in src
     assert "--use_teacher_weight" in rqat
     assert "--kd_loss_type forward_kl" in rqat
     assert "--lr_scheduler_type cosine" in rqat

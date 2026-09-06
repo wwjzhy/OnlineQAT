@@ -551,6 +551,93 @@ output/eval/Qwen3-1.7B-w3g128-reasoningqat
 
 ---
 
+## Exp #10（2026-09-06 新增）— W2-OPD，30 step warmup 后 **恒定峰值 LR**，共 100 step
+
+**要求：** 读 Exp #4 Stage 1 的 `w2g128`，OPD 设定与 `#8` 相同（student rollout + sampled reverse KL，CE=0，8 卡，batch 64，每 5 step 存 ckpt），学习率日程改为：
+
+| 项 | `#8` | **本实验 `#10`** |
+|--|--|--|
+| 峰值 LR | `2e-6` | **相同** |
+| Warmup | 前 30 step，自 `2e-7` 升到峰值 | **相同** |
+| Warmup 之后 | linear **衰减到 0**（50 step 里只剩 ~20 step 峰值且在掉） | **`constant_with_warmup`：峰值保持不变（stable）** |
+| 总 step | 50 | **100**（30 warmup + **70 stable**） |
+| 产出后缀 | `...-wu30-ws2e-7` | `...-wu30-ws2e-7-schhold` |
+
+不要 `--train-emb`，不要重训 Stage 1。用来检验：在 `#8` 已验证的「长 warmup + `2e-6`」上，**拉长稳定段、且不衰减**，GSM/MATH 是否继续涨、会不会再次崩。
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`（Exp #4 Stage 1）。
+
+**状态：** 未跑。需 `--lr-scheduler constant_with_warmup`（脚本 tag 缩写 `schhold`）。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 100 --save-steps 5 \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold \
+  --wbits 2 --eval-gpu 0 \
+  --steps 5,10,15,20,25,35,50,75,100 --skip-final
+```
+
+横幅应有 `lr_scheduler=constant_with_warmup`、`max_steps=100`。产出不要覆盖 `#8`。
+
+产出：
+
+```
+output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+output/eval/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-{5,...,100}
+log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+```
+
+和 `#8`（50 step + 衰减）对比：stable 段（step 30–100）是否单调更好、有无二次崩溃。
+
+---
+
+## 续训 / Resume（2026-09-06）
+
+`--save-steps N` 现在会同时写两套东西：
+
+| 路径 | 内容 | 能否 `--resume` |
+|--|--|--|
+| `log/distill/<tag>/checkpoint-*` | HF Trainer 全量（权重+Adam+scheduler） | **能** |
+| `output/distill/<tag>/checkpoint-*` | 仅评测用假量化快照 | **不能**（用 `--init-from`） |
+
+**真续训（推荐，需本次改动之后新跑过的实验）：** 把 `--max-steps` 提高到大于当前 `global_step`。
+
+```bash
+# 例：#8 已训到 50，接着训到 100（同一 tag，接上 Adam）
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 100 --save-steps 5 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --resume
+```
+
+**旧 #7/#8（只有 `output/distill/.../checkpoint-50`）：** 没有 Trainer ckpt，只能权重热启（Adam 清零；建议 `--warmup-steps 0` + 新 suffix）：
+
+```bash
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 50 --save-steps 5 \
+  --lr 2e-6 --warmup-steps 0 \
+  --init-from ./output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7/checkpoint-50 \
+  --run-suffix cont50
+```
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。

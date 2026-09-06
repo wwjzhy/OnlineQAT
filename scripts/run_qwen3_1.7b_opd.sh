@@ -31,6 +31,11 @@ MAX_STEPS="${MAX_STEPS:-0}"
 DISTILL_LR_OVERRIDE=""
 WARMUP_STEPS=""
 WARMUP_START_LR=""
+LR_SCHEDULER=""
+RESUME=0
+RESUME_FROM=""
+INIT_FROM=""
+RUN_SUFFIX=""
 
 MODEL="${MODEL_PATH:-/zju_0038/zq/models/Qwen3-1.7B}"
 TEACHER="${TEACHER_MODEL:-${MODEL}}"
@@ -72,11 +77,21 @@ Options:
   --lr RATE              Stage 2 learning rate (default: 5e-6 for W2, 1e-6 for W3)
   --warmup-steps N       Fixed warmup steps (default: warmup_ratio=0.2)
   --warmup-start-lr RATE LR at step 0 during warmup (default: 0)
+  --lr-scheduler NAME    HF schedule (default: linear; Exp #10 uses constant_with_warmup)
+  --resume               Resume from latest HF Trainer ckpt under log/distill/<tag>
+  --resume-from PATH     Resume from an explicit Trainer checkpoint directory
+  --init-from PATH       Weight-only warm-start (eval snapshot / distill dir); not true resume
+  --run-suffix STR       Append -<STR> to distill tag (e.g. cont50) to avoid overwriting
   --eval-gpu ID          GPU for convert+evalscope watcher (requires --save-steps > 0)
   -h, --help             Show this help
 
 Environment overrides: same as scripts/run_qwen3_1.7b.sh
   DISTILL_LR             Same as --lr if the flag is omitted
+
+Resume notes:
+  True resume needs log/distill/<tag>/checkpoint-* from a prior --save-steps run.
+  output/distill/<tag>/checkpoint-* is eval-only; use --init-from for those.
+  Raise --max-steps above the resumed global_step (e.g. 50 -> 100).
 EOF
 }
 
@@ -95,6 +110,11 @@ while [[ $# -gt 0 ]]; do
     --lr) DISTILL_LR_OVERRIDE="$2"; shift 2 ;;
     --warmup-steps) WARMUP_STEPS="$2"; shift 2 ;;
     --warmup-start-lr) WARMUP_START_LR="$2"; shift 2 ;;
+    --lr-scheduler) LR_SCHEDULER="$2"; shift 2 ;;
+    --resume) RESUME=1; shift ;;
+    --resume-from) RESUME_FROM="$2"; RESUME=1; shift 2 ;;
+    --init-from) INIT_FROM="$2"; shift 2 ;;
+    --run-suffix) RUN_SUFFIX="$2"; shift 2 ;;
     --eval-gpu) EVAL_GPU="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -147,11 +167,34 @@ if [[ -n "${WARMUP_START_LR}" ]]; then
   WS_TAG="$(printf '%s' "${WARMUP_START_LR}" | tr '[:upper:]' '[:lower:]' | sed 's/[.]/_/g')"
   DISTILL_TAG="${DISTILL_TAG}-ws${WS_TAG}"
 fi
+if [[ -n "${LR_SCHEDULER}" && "${LR_SCHEDULER}" != "linear" ]]; then
+  SCH_TAG="$(printf '%s' "${LR_SCHEDULER}" | tr '[:upper:]' '[:lower:]' | tr '-' '_' | sed 's/constant_with_warmup/hold/')"
+  DISTILL_TAG="${DISTILL_TAG}-sch${SCH_TAG}"
+fi
+if [[ -n "${RUN_SUFFIX}" ]]; then
+  DISTILL_TAG="${DISTILL_TAG}-${RUN_SUFFIX}"
+fi
 
 BLOCK_DIR="${ROOT}/output/block_qat/${EXP_NAME}"
+STUDENT_DIR="${BLOCK_DIR}"
+if [[ -n "${INIT_FROM}" ]]; then
+  STUDENT_DIR="${INIT_FROM}"
+fi
 DISTILL_DIR="${ROOT}/output/distill/${DISTILL_TAG}"
 DISTILL_LOG="${ROOT}/log/distill/${DISTILL_TAG}"
 VLLM_DIR="${ROOT}/output/vllm/${DISTILL_TAG}"
+
+if [[ "${RESUME}" -eq 1 && -n "${INIT_FROM}" ]]; then
+  echo "Use either --resume/--resume-from (Trainer ckpt) or --init-from (weight-only), not both" >&2
+  exit 1
+fi
+if [[ -n "${INIT_FROM}" && ! -f "${INIT_FROM}/config.json" ]]; then
+  echo "--init-from missing config.json: ${INIT_FROM}" >&2
+  exit 1
+fi
+if [[ "${RESUME}" -eq 1 && "${SAVE_STEPS}" -le 0 ]]; then
+  echo "[warn] --resume without --save-steps>0: further mid-run Trainer ckpts will not be written" >&2
+fi
 
 run_stage() {
   case "${STAGE}" in
@@ -223,6 +266,16 @@ fi
 if [[ -n "${WARMUP_START_LR}" ]]; then
   WARMUP_FLAGS+=(--warmup_start_lr "${WARMUP_START_LR}")
 fi
+if [[ -n "${LR_SCHEDULER}" ]]; then
+  WARMUP_FLAGS+=(--lr_scheduler_type "${LR_SCHEDULER}")
+fi
+
+RESUME_FLAGS=()
+if [[ -n "${RESUME_FROM}" ]]; then
+  RESUME_FLAGS+=(--resume_from_checkpoint "${RESUME_FROM}")
+elif [[ "${RESUME}" -eq 1 ]]; then
+  RESUME_FLAGS+=(--resume)
+fi
 
 if [[ -n "${EVAL_GPU}" ]]; then
   case ",${DISTILL_GPUS}," in
@@ -246,11 +299,14 @@ echo "  python=${PY}"
 echo "Stage 2 GPUs: ${DISTILL_GPUS}  (${N_DISTILL_GPUS} GPU, accum=${GRAD_ACCUM}, effective_batch=${EFFECTIVE_BATCH}, max_length=${MAX_LENGTH})"
 echo "  student generate then sampled reverse-KL policy gradient; no CE"
 echo "  lr=${DISTILL_LR} (default ${DEFAULT_DISTILL_LR})  warmup_steps=${WARMUP_STEPS:-ratio0.2}  warmup_start_lr=${WARMUP_START_LR:-0}"
-echo "  save_steps=${SAVE_STEPS}  max_steps=${MAX_STEPS:-epochs}  eval_gpu=${EVAL_GPU:-none}"
+echo "  lr_scheduler=${LR_SCHEDULER:-linear}  save_steps=${SAVE_STEPS}  max_steps=${MAX_STEPS:-epochs}  eval_gpu=${EVAL_GPU:-none}"
+echo "  resume=${RESUME}  resume_from=${RESUME_FROM:-auto}  init_from=${INIT_FROM:-none}  run_suffix=${RUN_SUFFIX:-none}"
 echo "Stage 3 GPU : ${CONVERT_GPU}"
 echo "Inputs / outputs:"
 echo "  block   ${BLOCK_DIR}   (from run_qwen3_1.7b.sh Stage 1)"
+echo "  student ${STUDENT_DIR}"
 echo "  distill ${DISTILL_DIR}"
+echo "  log     ${DISTILL_LOG}   (Trainer resume ckpts when --save-steps>0)"
 echo "  vllm    ${VLLM_DIR}"
 echo "============================================================"
 nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv || true
@@ -264,7 +320,7 @@ if run_stage 2; then
     echo "         Run: bash scripts/run_qwen3_1.7b.sh --wbits ${WBITS} --stage 1" >&2
     exit 1
   fi
-  if [[ "${SKIP_EXISTING}" -eq 1 ]] && dir_ready "${DISTILL_DIR}"; then
+  if [[ "${RESUME}" -eq 0 && -z "${INIT_FROM}" && "${SKIP_EXISTING}" -eq 1 ]] && dir_ready "${DISTILL_DIR}"; then
     echo "[stage2] skip, already exists: ${DISTILL_DIR}"
   else
     echo "[stage2] OPD e2e distill on GPUs ${DISTILL_GPUS} (effective_batch=${EFFECTIVE_BATCH})"
@@ -294,7 +350,7 @@ if run_stage 2; then
       --num_processes "${N_DISTILL_GPUS}" \
       --gpu_ids all \
       main_e2e_distill.py \
-      --model "${BLOCK_DIR}" \
+      --model "${STUDENT_DIR}" \
       --teacher_model "${TEACHER}" \
       --wbits "${WBITS}" \
       --group_size "${GROUP_SIZE}" \
@@ -312,6 +368,7 @@ if run_stage 2; then
       ${SAVE_STEPS_FLAG} \
       ${MAX_STEPS_FLAG} \
       ${WARMUP_FLAGS[@]+"${WARMUP_FLAGS[@]}"} \
+      ${RESUME_FLAGS[@]+"${RESUME_FLAGS[@]}"} \
       --save_quant_dir "${DISTILL_DIR}" \
       --output_dir "${DISTILL_LOG}"
     touch "${DISTILL_DIR}/.ready" "${DISTILL_DIR}/.train_done"

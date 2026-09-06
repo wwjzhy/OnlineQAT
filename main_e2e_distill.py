@@ -507,12 +507,15 @@ class PolicyGKDTrainer(GKDTrainer):
         return super().training_step(model, inputs, num_items_in_batch)
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
-        """Linear warmup from ``warmup_start_lr`` (default 0) to ``learning_rate``."""
+        """Warmup from ``warmup_start_lr`` to peak; then linear decay or hold."""
         if optimizer is None:
             optimizer = self.optimizer
         warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
         start_lr = float(getattr(self, "warmup_start_lr", 0.0) or 0.0)
         peak_lr = float(self.args.learning_rate)
+        sched = str(getattr(self.args, "lr_scheduler_type", "linear") or "linear")
+        hold_after_warmup = sched in ("constant", "constant_with_warmup")
+        # Non-zero warmup start needs a custom lambda; otherwise defer to HF.
         if warmup_steps <= 0 or start_lr <= 0.0 or peak_lr <= 0.0:
             return super().create_scheduler(num_training_steps, optimizer=optimizer)
 
@@ -522,6 +525,8 @@ class PolicyGKDTrainer(GKDTrainer):
             if current_step < warmup_steps:
                 progress = float(current_step) / float(max(1, warmup_steps))
                 return start_factor + (1.0 - start_factor) * progress
+            if hold_after_warmup:
+                return 1.0
             # Match HF linear schedule after warmup: decay to 0 by num_training_steps.
             return max(
                 0.0,
@@ -1113,7 +1118,24 @@ def main():
     parser.add_argument("--output_dir", default="./log/", type=str, help="direction of logging file")
     parser.add_argument("--save_quant_dir", default=None, type=str, help="direction for saving quantization model")
     parser.add_argument("--save_steps", type=int, default=0, help="Save a convert-ready quantized snapshot every N optimizer steps (0=final only)")
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=3,
+        help="Keep at most this many HF Trainer checkpoints under output_dir (optimizer+scheduler). 0=unlimited",
+    )
     parser.add_argument("--max_steps", type=int, default=-1, help="Cap optimizer steps (-1=use epochs)")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the latest Trainer checkpoint under --output_dir",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Resume from this Trainer checkpoint path (overrides --resume auto-detect)",
+    )
     parser.add_argument("--calib_dataset",type=str,default="redpajama",
         choices=["wikitext2", "ptb", "c4", "mix", "redpajama", "random"],
         help="Where to extract calibration data from.")
@@ -1212,6 +1234,11 @@ def main():
     # OPD: lmbda=1 student rollouts; max_new_tokens matches max_length budget.
     opd_gen_tokens = args.max_length if args.max_length else 8192
     use_fixed_warmup = args.warmup_steps is not None and args.warmup_steps >= 0
+    # Eval snapshots go to save_quant_dir; full Trainer state (for --resume) goes to output_dir.
+    enable_trainer_ckpt = bool(args.save_steps and args.save_steps > 0)
+    save_total_limit = None
+    if enable_trainer_ckpt and args.save_total_limit and args.save_total_limit > 0:
+        save_total_limit = args.save_total_limit
     training_args = GKDConfig(
         beta=args.gkd_beta,  # 1.0 -> forward KL(teacher||student) in generalized_jsd
         num_train_epochs=args.epochs,
@@ -1225,7 +1252,11 @@ def main():
         adam_beta1=0.9,     # Default AdamW beta1
         adam_beta2=0.95,   # Default AdamW beta2
         output_dir=args.output_dir,
-        save_strategy="no",
+        save_strategy="steps" if enable_trainer_ckpt else "no",
+        save_steps=args.save_steps if enable_trainer_ckpt else 500,
+        save_total_limit=save_total_limit,
+        save_only_model=False,
+        load_best_model_at_end=False,
         gradient_checkpointing=True,
         seq_kd=False, # enforce supervised KD
         lmbda=1.0 if on_policy_mode else 0.0,
@@ -1517,13 +1548,27 @@ def main():
         print(trainer.accelerator.distributed_type)
 
     from transformers.trainer_utils import get_last_checkpoint
-    #last_checkpoint = get_last_checkpoint(training_args.output_dir)
+
     last_checkpoint = None
+    if args.resume_from_checkpoint:
+        last_checkpoint = args.resume_from_checkpoint
+        if not Path(last_checkpoint).exists():
+            raise FileNotFoundError(f"--resume_from_checkpoint not found: {last_checkpoint}")
+    elif args.resume:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None:
+            raise FileNotFoundError(
+                f"--resume set but no Trainer checkpoint under {training_args.output_dir}. "
+                "Need a prior run with --save_steps>0 (writes output_dir/checkpoint-*). "
+                "Eval-only snapshots under save_quant_dir are not resumable; use that path as "
+                "--model for a weight-only warm-start instead."
+            )
     if last_checkpoint is not None:
+        logger.info(f"Resuming training from checkpoint: {last_checkpoint}")
         print(f"Resuming training from checkpoint: {last_checkpoint}")
         trainer.train(resume_from_checkpoint=last_checkpoint)
     else:
-        print("No valid checkpoint found. Starting training from scratch.")
+        print("No resume checkpoint. Starting training from scratch.")
         trainer.train()
 
 
