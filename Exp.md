@@ -498,6 +498,59 @@ log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7
 
 ---
 
+## Exp #9（2026-09-06 新增）— ReasoningQAT：完整复现论文主方法
+
+**要求：** 按 ReasoningQAT 论文目标函数做 Stage 1+2+3，**不要**用 Exp #1 的 plain CE + JSD 脚本当「论文复现」。Stage 1 与 `#1` 相同（`sweep_0.8` block QAT）；Stage 2 换成论文的 teacher-guided reward rectification + forward KL + cosine。产出后缀 `-reasoningqat`，**不要覆盖** `#1` 的 `w3g128` distill。
+
+| | Exp #1（旧「GKD」脚本） | **本实验 ReasoningQAT** |
+|--|--|--|
+| 脚本 | `run_qwen3_1.7b.sh` | **`run_qwen3_1.7b_reasoningqat.sh`** |
+| CE | 普通 `student_outputs.loss` | **`--use_teacher_weight`**：\(L_t=\mathrm{CE}\cdot\mathrm{sg}(\pi_T(y^\star))\) |
+| KD | `kd_loss_type=jsd`（且曾被 `beta=0.5` 盖成对称 JSD） | **`forward_kl`，`gkd_beta=1.0`，`top_k=20`** |
+| 调度 | linear + `warmup_ratio=0.2` | **`lr_scheduler_type=cosine`** + warmup_ratio 0.2 |
+| 权重 | \(\alpha=0.2\), \(\beta=1.0\) | 相同 |
+| 产出 | `Qwen3-1.7B-w3g128` | **`Qwen3-1.7B-w3g128-reasoningqat`** |
+
+W3 默认：`weight_lr=1e-5`，Stage 2 `lr=1e-6`，1 epoch，batch 64，OpenThoughts 32768，`max_length=8192`，不 `--train-emb`。W2 用 `--wbits 2`（Stage 1 `2e-5`，Stage 2 `5e-6` / 3 epoch）。
+
+论文公式：\(L=0.2\,L_t+1.0\,\mathrm{KL}(\pi_T\Vert\pi_S)\)。主表看 MATH-500 / LiveCodeBench / MMLU-Redux / GPQA-Diamond / IFEval 五任务均值（W3 论文约 **55.2**）；GSM8K/AIME 可顺带评，但不在论文主 avg 里。
+
+**依赖：** 无。若 `#1` 已有 `output/block_qat/Qwen3-1.7B-w3g128`，可 `--stage 2` 直接复用 Stage 1。
+
+**状态：** 未跑。已修 `PolicyGKDTrainer` 不再把 `beta` 硬盖成 0.5；新增 `--lr_scheduler_type` / `--gkd_beta`。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+# 整条（Stage 1 没有则训；有则用 --skip-existing 跳过 Stage 1）
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 3 --gpus 0,1,2,3,4,5,6,7
+
+# 或只跑 Stage 2+3（读已有 Stage 1）
+test -f output/block_qat/Qwen3-1.7B-w3g128/config.json
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 3 --stage 2 --gpus 0,1,2,3,4,5,6,7
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 3 --stage 3
+
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-1.7B-w3g128-reasoningqat \
+  ./output/eval/Qwen3-1.7B-w3g128-reasoningqat
+```
+
+训练横幅应看到 `loss: 0.2 * teacher-weighted CE + 1.0 * forward_kl`，产出目录带 `-reasoningqat`。
+
+产出：
+
+```
+output/block_qat/Qwen3-1.7B-w3g128          # 可与 #1 共用
+output/distill/Qwen3-1.7B-w3g128-reasoningqat
+output/vllm/Qwen3-1.7B-w3g128-reasoningqat
+output/eval/Qwen3-1.7B-w3g128-reasoningqat
+```
+
+和 `#1` 的 `output/eval/Qwen3-1.7B-w3g128` 对比：本实验应更接近论文主表。
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。

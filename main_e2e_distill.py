@@ -175,7 +175,7 @@ class PolicyGKDTrainer(GKDTrainer):
         top_k=None,
         kd_loss_type="jsd",
         mean_prob=0,
-        beta=0.5,
+        beta=None,
         opd_mode=False,
         pv_opd_mode=False,
         pv_probe_bits=4,
@@ -194,7 +194,9 @@ class PolicyGKDTrainer(GKDTrainer):
         self.top_k = top_k
         self.kd_loss_type = kd_loss_type
         self.mean_prob = mean_prob
-        self.beta = beta
+        # None keeps GKDTrainer's args.beta (do not clobber with a hard-coded 0.5).
+        if beta is not None:
+            self.beta = beta
         self.opd_mode = opd_mode
         self.pv_opd_mode = pv_opd_mode
         self.pv_probe_bits = pv_probe_bits
@@ -1130,6 +1132,18 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate")
     parser.add_argument("--warmup_steps", type=int, default=-1, help="Linear warmup steps; -1 keeps warmup_ratio=0.2")
     parser.add_argument("--warmup_start_lr", type=float, default=0.0, help="LR at step 0 when warmup_steps>0; 0 starts from 0")
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="linear",
+        help="HF LR schedule (paper ReasoningQAT uses cosine)",
+    )
+    parser.add_argument(
+        "--gkd_beta",
+        type=float,
+        default=1.0,
+        help="GKD generalized-JSD beta; 1.0 -> forward KL(teacher||student)",
+    )
     parser.add_argument("--optim", type=str, default="adamw_torch", help="optimizer")
     parser.add_argument("--max_length", type=int, default=None, help="maximum sequence length")
     parser.add_argument("--per_device_train_batch_size", type=int, default=1, help="per device train batch size")
@@ -1199,7 +1213,7 @@ def main():
     opd_gen_tokens = args.max_length if args.max_length else 8192
     use_fixed_warmup = args.warmup_steps is not None and args.warmup_steps >= 0
     training_args = GKDConfig(
-        beta=1.0, # KL(student || teacher)
+        beta=args.gkd_beta,  # 1.0 -> forward KL(teacher||student) in generalized_jsd
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         max_length=args.max_length,
@@ -1217,6 +1231,7 @@ def main():
         lmbda=1.0 if on_policy_mode else 0.0,
         temperature=0.6,
         logging_steps=1,
+        lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps if use_fixed_warmup else 0,
         warmup_ratio=0.0 if use_fixed_warmup else 0.2,
         max_grad_norm=0.5,  # Reduced from 1.0 for more aggressive gradient clipping
@@ -1477,6 +1492,12 @@ def main():
             f"warmup_steps={args.warmup_steps} warmup_start_lr={args.warmup_start_lr} "
             f"peak_lr={args.learning_rate}"
         )
+    logger.info(
+        f"distill loss: kd={args.kd_loss_type} gkd_beta={args.gkd_beta} "
+        f"kl_weight={args.kl_weight} ce_weight={args.cross_entropy_weight} "
+        f"use_teacher_weight={args.use_teacher_weight} use_dft_loss={args.use_dft_loss} "
+        f"top_k={args.top_k} lr_scheduler={args.lr_scheduler_type}"
+    )
     if on_policy_mode:
         # Cap prompt+rollout at the same sequence budget as GKD (collator max_length).
         # Do not set max_new_tokens=8192: that would allow prompt_len + 8192 > GKD's 8192.

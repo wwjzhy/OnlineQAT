@@ -256,6 +256,7 @@ def test_opd_masks_keep_first_eos_and_drop_later_padding():
 def test_scripts_gkd_vs_opd_flags():
     gkd = (ROOT / "scripts" / "run_qwen3_1.7b.sh").read_text()
     opd = (ROOT / "scripts" / "run_qwen3_1.7b_opd.sh").read_text()
+    rqat = (ROOT / "scripts" / "run_qwen3_1.7b_reasoningqat.sh").read_text()
     assert "--opd" not in gkd
     assert "--cross_entropy_weight 0.2" in gkd
     assert "--kd_loss_type jsd" in gkd
@@ -271,6 +272,20 @@ def test_scripts_gkd_vs_opd_flags():
     assert "--warmup-steps" in opd
     assert "--warmup-start-lr" in opd
     assert "eval_distill_checkpoints.sh" in opd
+    assert "--use_teacher_weight" in rqat
+    assert "--kd_loss_type forward_kl" in rqat
+    assert "--lr_scheduler_type cosine" in rqat
+    assert "-reasoningqat" in rqat
+    assert "--use_teacher_weight" not in gkd
+    assert "--kd_loss_type forward_kl" not in gkd
+
+
+def test_policy_trainer_beta_default_is_none():
+    """beta=None keeps GKDTrainer.args.beta; do not hard-code 0.5."""
+    import inspect
+
+    default = inspect.signature(PolicyGKDTrainer.__init__).parameters["beta"].default
+    assert default is None
 
 
 def test_save_quantized_eval_checkpoint_restores_weights():
@@ -359,6 +374,7 @@ if __name__ == "__main__":
         test_generation_budget_is_total_max_length_not_extra_new_tokens,
         test_opd_masks_keep_first_eos_and_drop_later_padding,
         test_scripts_gkd_vs_opd_flags,
+        test_policy_trainer_beta_default_is_none,
         test_save_quantized_eval_checkpoint_restores_weights,
         test_opd_dispatches_sampled_reverse_kl,
         test_opd_generate_runs_in_eval_then_restores_train,
