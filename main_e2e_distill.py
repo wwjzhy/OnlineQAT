@@ -40,9 +40,17 @@ from datasets import load_dataset
 import copy
 import quantize.int_linear_fake as int_linear_fake
 from quantize.utils import set_op_by_name, set_quant_state, quant_inplace
+from quantize.opd_metrics import (
+    code_jump_rate,
+    master_rel_change,
+    reduce_mean_scalar,
+    rollout_truncation_metrics,
+    snapshot_quant_codes,
+)
 import types
 from functools import partial
 from typing import Optional
+import json
 import torch.nn.functional as F
 from dataclasses import dataclass
 
@@ -205,6 +213,8 @@ class PolicyGKDTrainer(GKDTrainer):
         self.pv_adv_clip = pv_adv_clip
         self.pv_adv_clip_warmup_steps = pv_adv_clip_warmup_steps
         self._pv_adv_clip_estimates = []
+        self._pending_opd_rollout_metrics = {}
+        self._pending_opd_jump_metrics = {}
         self._pv_adv_clip_value = pv_adv_clip if pv_adv_clip > 0 else None
         self._pv_clip_last_step = None
         self._pv_metrics_last_step = None
@@ -499,12 +509,42 @@ class PolicyGKDTrainer(GKDTrainer):
                 eos_token_id=self.generation_config.eos_token_id,
                 pad_token_id=self.processing_class.pad_token_id,
             )
+            max_length = int(
+                getattr(self.generation_config, "max_length", None)
+                or new_input_ids.shape[1]
+            )
+            local_metrics = rollout_truncation_metrics(
+                generated_tokens=new_input_ids,
+                prompt_attention_mask=prompt_attention_mask,
+                eos_token_id=self.generation_config.eos_token_id,
+                max_length=max_length,
+                pad_token_id=self.processing_class.pad_token_id,
+            )
+            device = new_input_ids.device
+            reduced = {
+                key: reduce_mean_scalar(val, device) for key, val in local_metrics.items()
+            }
+            self._pending_opd_rollout_metrics = reduced
             inputs = dict(inputs)
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
             return super(GKDTrainer, self).training_step(model, inputs, num_items_in_batch)
         return super().training_step(model, inputs, num_items_in_batch)
+
+    def log(self, logs, start_time=None, **kwargs):
+        """Inject OPD diagnostics before HF writes log_history / reporters."""
+        for key, val in (getattr(self, "_pending_opd_rollout_metrics", None) or {}).items():
+            logs[f"opd/{key}"] = val
+        for key, val in (getattr(self, "_pending_opd_jump_metrics", None) or {}).items():
+            logs[f"opd/{key}"] = val
+        self._pending_opd_rollout_metrics = {}
+        self._pending_opd_jump_metrics = {}
+        # transformers versions differ on log() signature
+        try:
+            return super().log(logs, start_time=start_time, **kwargs)
+        except TypeError:
+            return super().log(logs)
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         """Warmup from ``warmup_start_lr`` to peak; then linear decay or hold."""
@@ -861,6 +901,63 @@ class QuantEvalSnapshotCallback(TrainerCallback):
             save_quantized_eval_checkpoint(unwrapped, self.tokenizer, ckpt_dir)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+
+class OpdMetricsCallback(TrainerCallback):
+    """Log rollout truncation, code-jump, and grad_norm on one step timeline."""
+
+    def __init__(self, trainer_ref_holder: dict, output_dir: str, track_code_jump: bool = True):
+        self._holder = trainer_ref_holder
+        self.output_dir = Path(output_dir)
+        self.metrics_path = self.output_dir / "opd_step_metrics.jsonl"
+        self.track_code_jump = track_code_jump
+        self._prev_codes = None
+        self._prev_weights = None
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _trainer(self):
+        return self._holder.get("trainer")
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero or model is None or not self.track_code_jump:
+            return
+        unwrapped = model.module if hasattr(model, "module") else model
+        self._prev_codes = snapshot_quant_codes(unwrapped)
+        _, self._prev_weights = master_rel_change(None, unwrapped)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero or model is None or not self.track_code_jump:
+            return
+        unwrapped = model.module if hasattr(model, "module") else model
+        new_codes = snapshot_quant_codes(unwrapped)
+        jump = code_jump_rate(self._prev_codes, new_codes)
+        rel, new_weights = master_rel_change(self._prev_weights, unwrapped)
+        jump["master_rel_change"] = rel
+        if jump.get("code_jump_rate", 0.0) > 0 and rel > 0:
+            jump["code_jump_amplification"] = float(
+                jump["code_jump_rate"] / max(rel, 1e-12)
+            )
+        else:
+            jump["code_jump_amplification"] = 0.0
+        trainer = self._trainer()
+        if trainer is not None:
+            trainer._pending_opd_jump_metrics = jump
+        self._prev_codes = new_codes
+        self._prev_weights = new_weights
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None or not state.is_world_process_zero:
+            return
+        record = {"step": int(state.global_step)}
+        for key, val in logs.items():
+            if key == "step":
+                continue
+            try:
+                record[key] = float(val)
+            except (TypeError, ValueError):
+                record[key] = val
+        with self.metrics_path.open("a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 @torch.no_grad()
@@ -1493,6 +1590,20 @@ def main():
         )
         logger.info(f"Quant eval snapshots every {args.save_steps} steps -> {args.save_quant_dir}/checkpoint-*")
 
+    trainer_ref_holder = {}
+    if on_policy_mode:
+        callbacks.append(
+            OpdMetricsCallback(
+                trainer_ref_holder,
+                output_dir=training_args.output_dir,
+                track_code_jump=True,
+            )
+        )
+        logger.info(
+            f"OPD step metrics (truncation/code-jump/grad_norm) -> "
+            f"{training_args.output_dir}/opd_step_metrics.jsonl"
+        )
+
     trainer = PolicyGKDTrainer(
         kl_weight=args.kl_weight,
         cross_entropy_weight=args.cross_entropy_weight,
@@ -1517,6 +1628,7 @@ def main():
         callbacks=callbacks or None,
         # optimizers=(optimizer, None),
     )
+    trainer_ref_holder["trainer"] = trainer
     trainer.warmup_start_lr = float(args.warmup_start_lr)
     if use_fixed_warmup:
         logger.info(

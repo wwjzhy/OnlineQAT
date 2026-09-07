@@ -92,6 +92,14 @@ Resume notes:
   True resume needs log/distill/<tag>/checkpoint-* from a prior --save-steps run.
   output/distill/<tag>/checkpoint-* is eval-only; use --init-from for those.
   Raise --max-steps above the resumed global_step (e.g. 50 -> 100).
+
+OPD diagnostics (auto when --opd Stage 2 runs):
+  Per-step truncation / code-jump / grad_norm -> log/distill/<tag>/opd_step_metrics.jsonl
+  Merge with eval checkpoints:
+    python scripts/merge_opd_timeline.py \\
+      --metrics log/distill/<tag>/opd_step_metrics.jsonl \\
+      --eval-root output/eval/<tag> \\
+      --out-dir output/plots/<tag>
 EOF
 }
 

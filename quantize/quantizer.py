@@ -164,7 +164,19 @@ class UniformAffineQuantizer(nn.Module):
         if self.group_size:
             x_dequant = x_dequant.reshape(dim1, dim2)
         return x_dequant
-    
+
+    @torch.no_grad()
+    def integer_codes(self, x: torch.Tensor) -> torch.Tensor:
+        """Return clamped integer quantization codes for ``x`` (same grid as fake_quant)."""
+        scale = clamp_ste(self.scale.abs(), CLIPMIN, 1e4)
+        round_zero_point = clamp_ste(round_ste(self.zero_point), self.qmin, self.qmax)
+        dim1, dim2 = x.shape
+        grouped = x.reshape(-1, self.group_size).float()
+        x_int = (grouped / (scale + 1e-6)).round()
+        if round_zero_point is not None:
+            x_int = x_int.add(round_zero_point)
+        x_int = x_int.clamp(self.qmin, self.qmax)
+        return x_int.reshape(dim1, dim2).to(torch.int16)
 
     def forward(self, x: torch.Tensor):
         dtype = x.dtype

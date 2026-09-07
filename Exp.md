@@ -9,6 +9,11 @@
 - W3A16，不要 `--train-emb`，不要把 `--wbits` 改成 2
 - 评测：evalscope 一套（`eval_paper_benchmarks.sh` 起 `vllm serve`，再走 openai_api），T=0.6，top_k=20，max_tokens=8192
   GSM8K、AIME24、AIME25、MATH-500、LiveCodeBench、MMLU-Redux、GPQA-Diamond、IFEval
+- **每次 Stage 2（尤其 OPD）训完必做诊断落盘 + 出图**，不是可选项。详见文末「OPD 逐步诊断」。最低交付：
+  1. 确认 `log/distill/<tag>/opd_step_metrics.jsonl` 存在且覆盖全程 step
+  2. `merge_opd_timeline.py` 合并评测 → `output/plots/<tag>/opd_timeline.{csv,jsonl}`
+  3. 同 step 轴画出至少：`truncation_rate`、`code_jump_rate`（+ amplification）、`grad_norm`、主评测分（GSM8K / MATH-500）；图存 `output/plots/<tag>/`
+  4. 在该次 Exp 的**状态**里写上 metrics / timeline / 图路径
 - 硬件：8 张同构 GPU（推荐 H20 96G）。A100 40G Stage 2 OOM 则该次命令加 `--max-length 4096`。不要混用 A100 和 H20
 - CUDA：`scripts/setup_env_cu129.sh`
 
@@ -638,6 +643,58 @@ bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
 
 ---
 
+## OPD 逐步诊断（truncation / 跳码 / grad_norm / eval）
+
+**强制：** 每一次 OPD / Stage 2 训练结束后，都要把下面这套 log **收齐、合并、画图**，再在该 Exp 的状态里挂路径。只报最终 GSM 分、不交 timeline 图，算没做完。
+
+### 训练时自动落盘
+
+Stage 2 开 `--opd` 时，rank0 自动写：
+
+| 文件 | 内容 |
+|------|------|
+| `log/distill/<tag>/opd_step_metrics.jsonl` | 每 optimizer step 一行 |
+
+字段（前缀 `opd/` 的也进 Trainer log）：
+
+- **truncation：** `truncation_rate`、`eos_rate`、`mean_response_len`、`hit_max_length_rate`（无 EOS 且顶满 `max_length` 算截断）
+- **跳码：** `code_jump_rate`、`code_jump_count`、`master_rel_change`、`code_jump_amplification`
+- **优化：** `loss`、`grad_norm`、`learning_rate`
+
+训完先确认 JSONL 行数 ≈ `max_steps`（resume 则覆盖续训区间）。缺文件 = 诊断没开，不要直接评测结案。
+
+### 训后必做：合并 + 出图
+
+```bash
+# <tag> 换成该次 DISTILL_TAG，例如 Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+python scripts/merge_opd_timeline.py \
+  --metrics log/distill/<tag>/opd_step_metrics.jsonl \
+  --eval-root output/eval/<tag> \
+  --out-dir output/plots/<tag>
+```
+
+产出：
+
+- `output/plots/<tag>/opd_timeline.csv`
+- `output/plots/<tag>/opd_timeline.jsonl`
+
+**同一 step 轴至少画 4 条曲线（可多子图）：**
+
+1. `opd/truncation_rate`（可叠 `eos_rate` / `mean_response_len`）
+2. `opd/code_jump_rate` + `opd/code_jump_amplification`
+3. `grad_norm`（可叠 `learning_rate`）
+4. eval：`GSM8K` / `MATH-500`（以及该次 `--save-steps` 有的 checkpoint 分）
+
+图保存到 `output/plots/<tag>/`（如 `timeline.png` / 分面板 PDF）。状态栏示例：
+
+```text
+metrics: log/distill/<tag>/opd_step_metrics.jsonl
+timeline: output/plots/<tag>/opd_timeline.csv
+plots: output/plots/<tag>/timeline.png
+```
+
+---
+
 ## 以后怎么加
 
 下一次加实验：复制下面模板接到文末，编号 +1。不要回头改 `#1`、`#2`、`#3` 的要求。
@@ -650,8 +707,10 @@ bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
 **依赖：** …（没有就写「无」）
 
 **状态：** 未跑 / 跑到哪 / 结果路径
+（OPD/Stage2 跑完须附：opd_step_metrics.jsonl、opd_timeline、plots 路径）
 
 ```bash
 # 只写这一次的命令
+# 训完：merge_opd_timeline.py + 出图 → output/plots/<tag>/
 ```
 ```
