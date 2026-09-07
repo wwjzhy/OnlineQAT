@@ -610,6 +610,57 @@ log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
 
 ---
 
+## Exp #11（2026-09-07 新增）— ReasoningQAT 论文主方法跑 **W2**
+
+**要求：** 用和 `#9` 同一套**论文目标函数**在 **W2A16** 上跑满 Stage 1+2+3 + 公共约定评测。**不要**用 Exp #4 的 `run_qwen3_1.7b.sh`（那是旧 GKD：plain CE + JSD）当「论文 W2 结果」。本实验覆盖公共约定里的「不要把 `--wbits` 改成 2」。不要 `--train-emb`，不要跑 OPD。
+
+| | Exp #4 | Exp #9 | **本实验 `#11`** |
+|--|--|--|--|
+| 位宽 | W2 | W3 | **W2** |
+| 脚本 | `run_qwen3_1.7b.sh` | `run_qwen3_1.7b_reasoningqat.sh` | **同 `#9` 脚本** |
+| Stage 2 loss | plain CE + JSD | teacher-weighted CE + `forward_kl` + cosine | **同 `#9`** |
+| Stage 1 `weight_lr` | `2e-5` | `1e-5` | **`2e-5`** |
+| Stage 2 lr / epoch | `5e-6` / 3（1536 step） | `1e-6` / 1 | **`5e-6` / 3（1536 step）** |
+| 产出 | `…-w2g128` | `…-w3g128-reasoningqat` | **`…-w2g128-reasoningqat`** |
+
+论文公式不变：\(L=0.2\,L_t+1.0\,\mathrm{KL}(\pi_T\Vert\pi_S)\)，`top_k=20`，`gkd_beta=1.0`，cosine + warmup_ratio 0.2。主表看 MATH-500 / LiveCodeBench / MMLU-Redux / GPQA-Diamond / IFEval 五任务均值；GSM8K/AIME 顺带评。和 `#4`（同 bit、错 loss）、`#9`（同 loss、W3）对比。
+
+**依赖：** 无。若 `#4` 已有 `output/block_qat/Qwen3-1.7B-w2g128`，可 `--stage 2` 复用 Stage 1（**不要**覆盖 `#4` 的 distill `w2g128`；本实验写出 `-reasoningqat`）。
+
+**状态：** 未跑。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+# 整条（无 Stage 1 则训；有 #4 Stage 1 可用 --skip-existing 跳过 Stage 1）
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 2 --gpus 0,1,2,3,4,5,6,7
+
+# 或只跑 Stage 2+3
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 2 --stage 2 --gpus 0,1,2,3,4,5,6,7
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 2 --stage 3
+
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-1.7B-w2g128-reasoningqat \
+  ./output/eval/Qwen3-1.7B-w2g128-reasoningqat
+```
+
+横幅应看到 `loss: 0.2 * teacher-weighted CE + 1.0 * forward_kl`、`wbits=2`、`lr=5e-6`、`epochs=3`。W2 Stage 2 约 1536 step，比 `#9` 长约 3 倍。
+
+产出：
+
+```
+output/block_qat/Qwen3-1.7B-w2g128                 # 可与 #4 共用
+output/distill/Qwen3-1.7B-w2g128-reasoningqat
+output/vllm/Qwen3-1.7B-w2g128-reasoningqat
+output/eval/Qwen3-1.7B-w2g128-reasoningqat
+```
+
+对比：`#4` 的 `output/eval/Qwen3-1.7B-w2g128`（旧 GKD）、`#9` 的 `…-w3g128-reasoningqat`（论文方法 W3）。不要覆盖 `#4` / `#9`。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
