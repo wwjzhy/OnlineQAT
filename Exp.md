@@ -9,11 +9,12 @@
 - W3A16，不要 `--train-emb`，不要把 `--wbits` 改成 2
 - 评测：evalscope 一套（`eval_paper_benchmarks.sh` 起 `vllm serve`，再走 openai_api），T=0.6，top_k=20，max_tokens=8192
   GSM8K、AIME24、AIME25、MATH-500、LiveCodeBench、MMLU-Redux、GPQA-Diamond、IFEval
+- **结果报告不只交 benchmark 分。** 每次 Stage 2 / OPD 结案，状态里必须同时写清 **时间与吞吐**（见文末「结果报告清单」），缺训练时间 / rollout 时间算没做完
 - **每次 Stage 2（尤其 OPD）训完必做诊断落盘 + 出图**，不是可选项。详见文末「OPD 逐步诊断」。最低交付：
   1. 确认 `log/distill/<tag>/opd_step_metrics.jsonl` 存在且覆盖全程 step
   2. `merge_opd_timeline.py` 合并评测 → `output/plots/<tag>/opd_timeline.{csv,jsonl}`
   3. 同 step 轴画出至少：`truncation_rate`、`code_jump_rate`（+ amplification）、`grad_norm`、主评测分（GSM8K / MATH-500）；图存 `output/plots/<tag>/`
-  4. 在该次 Exp 的**状态**里写上 metrics / timeline / 图路径
+  4. 在该次 Exp 的**状态**里写上 metrics / timeline / 图路径，以及下面「结果报告清单」里的时间项
 - 硬件：8 张同构 GPU（推荐 H20 96G）。A100 40G Stage 2 OOM 则该次命令加 `--max-length 4096`。不要混用 A100 和 H20
 - CUDA：`scripts/setup_env_cu129.sh`
 
@@ -696,7 +697,7 @@ bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
 
 ## OPD 逐步诊断（truncation / 跳码 / grad_norm / eval）
 
-**强制：** 每一次 OPD / Stage 2 训练结束后，都要把下面这套 log **收齐、合并、画图**，再在该 Exp 的状态里挂路径。只报最终 GSM 分、不交 timeline 图，算没做完。
+**强制：** 每一次 OPD / Stage 2 训练结束后，都要把下面这套 log **收齐、合并、画图**，再在该 Exp 的状态里挂路径。只报最终 GSM 分、不交 timeline 图 / 时间数字，算没做完。
 
 ### 训练时自动落盘
 
@@ -705,11 +706,13 @@ Stage 2 开 `--opd` 时，rank0 自动写：
 | 文件 | 内容 |
 |------|------|
 | `log/distill/<tag>/opd_step_metrics.jsonl` | 每 optimizer step 一行 |
+| `log/distill/<tag>/opd_timing_summary.json` | 训完汇总：wall / mean step / mean rollout |
 
 字段（前缀 `opd/` 的也进 Trainer log）：
 
 - **truncation：** `truncation_rate`、`eos_rate`、`mean_response_len`、`hit_max_length_rate`（无 EOS 且顶满 `max_length` 算截断）
 - **跳码：** `code_jump_rate`、`code_jump_count`、`master_rel_change`、`code_jump_amplification`
+- **时间：** `rollout_seconds`（该 step 内 generate 墙钟，含 grad accum 微批求和）、`step_seconds`（相邻 optimizer step 墙钟）
 - **优化：** `loss`、`grad_norm`、`learning_rate`
 
 训完先确认 JSONL 行数 ≈ `max_steps`（resume 则覆盖续训区间）。缺文件 = 诊断没开，不要直接评测结案。
@@ -736,11 +739,50 @@ python scripts/merge_opd_timeline.py \
 3. `grad_norm`（可叠 `learning_rate`）
 4. eval：`GSM8K` / `MATH-500`（以及该次 `--save-steps` 有的 checkpoint 分）
 
+可选加面板：`opd/rollout_seconds`、`opd/step_seconds`。
+
 图保存到 `output/plots/<tag>/`（如 `timeline.png` / 分面板 PDF）。状态栏示例：
 
 ```text
 metrics: log/distill/<tag>/opd_step_metrics.jsonl
+timing: log/distill/<tag>/opd_timing_summary.json
 timeline: output/plots/<tag>/opd_timeline.csv
+plots: output/plots/<tag>/timeline.png
+```
+
+---
+
+## 结果报告清单（后续 Exp 强制）
+
+结案时在该 Exp **状态**里同时写 **分数 + 时间**，不要只贴 GSM/MATH。硬件与设定也要一行写清（GPU 型号×卡数、`max_length`、effective batch、总 step）。
+
+### 必报（所有 Stage 2：GKD / ReasoningQAT / OPD）
+
+| 项 | 从哪读 | 备注 |
+|--|--|--|
+| 主评测分 | `output/eval/<tag>/` | 公共约定套件；至少写出主表五任务 + GSM8K |
+| Stage 2 总墙钟 | 脚本起止 / `opd_timing_summary.json` 的 `wall_clock_seconds` / HF `train_runtime` | 写成小时或分钟，注明是否含 eval |
+| 总 optimizer steps | 横幅 / `trainer_state.json` | 例如 512 / 100 |
+| steps/hour 或 sec/step | 总墙钟 ÷ steps | 便于和别的 Exp 比吞吐 |
+| 硬件 | `nvidia-smi` | 如 8×H20，`max_length=8192` |
+
+非 OPD（`#9` / `#11` 等）若没有 `opd_timing_summary.json`：用训练 log 起止时间，或 `log/distill/<tag>/trainer_state.json` / 最终 log 里的 `train_runtime`、`train_samples_per_second`。
+
+### OPD 额外必报
+
+| 项 | 从哪读 |
+|--|--|
+| 平均 rollout 时间 / step | `opd_timing_summary.json` → `mean_rollout_seconds` |
+| 平均 step 墙钟 | 同上 → `mean_step_seconds` |
+| rollout 占 step 比例 | 同上 → `rollout_fraction_of_step` |
+| 截断率走势 | 图或 JSONL 摘要（起 / 中 / 末） |
+
+状态示例：
+
+```text
+eval: GSM8K=.. MATH-500=.. (full suite path=...)
+timing: Stage2 wall=3.2h (8xH20), 100 steps, 115s/step;
+        mean_rollout=98s (85% of step); summary=log/distill/<tag>/opd_timing_summary.json
 plots: output/plots/<tag>/timeline.png
 ```
 
@@ -758,10 +800,12 @@ plots: output/plots/<tag>/timeline.png
 **依赖：** …（没有就写「无」）
 
 **状态：** 未跑 / 跑到哪 / 结果路径
-（OPD/Stage2 跑完须附：opd_step_metrics.jsonl、opd_timeline、plots 路径）
+（须附：benchmark 分 + Stage2 墙钟/sec-per-step；OPD 另附 rollout 时间、
+ opd_step_metrics.jsonl、opd_timing_summary.json、opd_timeline、plots）
 
 ```bash
 # 只写这一次的命令
 # 训完：merge_opd_timeline.py + 出图 → output/plots/<tag>/
+# 状态里填结果报告清单（分数 + 时间）
 ```
 ```

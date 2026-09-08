@@ -215,6 +215,7 @@ class PolicyGKDTrainer(GKDTrainer):
         self._pv_adv_clip_estimates = []
         self._pending_opd_rollout_metrics = {}
         self._pending_opd_jump_metrics = {}
+        self._accum_opd_rollout_seconds = 0.0
         self._pv_adv_clip_value = pv_adv_clip if pv_adv_clip > 0 else None
         self._pv_clip_last_step = None
         self._pv_metrics_last_step = None
@@ -492,6 +493,9 @@ class PolicyGKDTrainer(GKDTrainer):
     def training_step(self, model, inputs, num_items_in_batch=None):
         """OPD: roll out the student before applying sampled reverse KL."""
         if self.opd_mode:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            rollout_t0 = time.perf_counter()
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 # train() + gradient checkpointing forces use_cache=False (O(T^2) decode).
                 # Fake-quant also re-rounds full W every token unless cached.
@@ -499,6 +503,9 @@ class PolicyGKDTrainer(GKDTrainer):
                     new_input_ids, _, _ = self.generate_on_policy_outputs(
                         unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                     )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            rollout_seconds = float(time.perf_counter() - rollout_t0)
             prompt_attention_mask = inputs.get(
                 "prompt_attention_mask",
                 torch.ones_like(inputs["prompts"]),
@@ -524,6 +531,11 @@ class PolicyGKDTrainer(GKDTrainer):
             reduced = {
                 key: reduce_mean_scalar(val, device) for key, val in local_metrics.items()
             }
+            # Sum microbatch rollout wall times within one optimizer step (grad accum).
+            reduced["rollout_seconds"] = float(
+                getattr(self, "_accum_opd_rollout_seconds", 0.0) + rollout_seconds
+            )
+            self._accum_opd_rollout_seconds = reduced["rollout_seconds"]
             self._pending_opd_rollout_metrics = reduced
             inputs = dict(inputs)
             inputs["input_ids"] = new_input_ids
@@ -540,6 +552,7 @@ class PolicyGKDTrainer(GKDTrainer):
             logs[f"opd/{key}"] = val
         self._pending_opd_rollout_metrics = {}
         self._pending_opd_jump_metrics = {}
+        self._accum_opd_rollout_seconds = 0.0
         # transformers versions differ on log() signature
         try:
             return super().log(logs, start_time=start_time, **kwargs)
@@ -904,21 +917,30 @@ class QuantEvalSnapshotCallback(TrainerCallback):
 
 
 class OpdMetricsCallback(TrainerCallback):
-    """Log rollout truncation, code-jump, and grad_norm on one step timeline."""
+    """Log rollout truncation, code-jump, timing, and grad_norm on one step timeline."""
 
     def __init__(self, trainer_ref_holder: dict, output_dir: str, track_code_jump: bool = True):
         self._holder = trainer_ref_holder
         self.output_dir = Path(output_dir)
         self.metrics_path = self.output_dir / "opd_step_metrics.jsonl"
+        self.summary_path = self.output_dir / "opd_timing_summary.json"
         self.track_code_jump = track_code_jump
         self._prev_codes = None
         self._prev_weights = None
+        self._train_t0 = None
+        self._step_t0 = None
+        self._step_seconds_sum = 0.0
+        self._rollout_seconds_sum = 0.0
+        self._n_logged_steps = 0
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _trainer(self):
         return self._holder.get("trainer")
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        now = time.perf_counter()
+        self._train_t0 = now
+        self._step_t0 = now
         if not state.is_world_process_zero or model is None or not self.track_code_jump:
             return
         unwrapped = model.module if hasattr(model, "module") else model
@@ -926,6 +948,14 @@ class OpdMetricsCallback(TrainerCallback):
         _, self._prev_weights = master_rel_change(None, unwrapped)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        now = time.perf_counter()
+        step_seconds = float(now - self._step_t0) if self._step_t0 is not None else 0.0
+        self._step_t0 = now
+        trainer = self._trainer()
+        if trainer is not None:
+            pending = dict(getattr(trainer, "_pending_opd_jump_metrics", {}) or {})
+            pending["step_seconds"] = step_seconds
+            trainer._pending_opd_jump_metrics = pending
         if not state.is_world_process_zero or model is None or not self.track_code_jump:
             return
         unwrapped = model.module if hasattr(model, "module") else model
@@ -939,7 +969,7 @@ class OpdMetricsCallback(TrainerCallback):
             )
         else:
             jump["code_jump_amplification"] = 0.0
-        trainer = self._trainer()
+        jump["step_seconds"] = step_seconds
         if trainer is not None:
             trainer._pending_opd_jump_metrics = jump
         self._prev_codes = new_codes
@@ -956,8 +986,55 @@ class OpdMetricsCallback(TrainerCallback):
                 record[key] = float(val)
             except (TypeError, ValueError):
                 record[key] = val
+        rollout_s = record.get("opd/rollout_seconds")
+        step_s = record.get("opd/step_seconds")
+        if isinstance(rollout_s, (int, float)):
+            self._rollout_seconds_sum += float(rollout_s)
+        if isinstance(step_s, (int, float)):
+            self._step_seconds_sum += float(step_s)
+        self._n_logged_steps += 1
         with self.metrics_path.open("a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        wall = (
+            float(time.perf_counter() - self._train_t0)
+            if self._train_t0 is not None
+            else None
+        )
+        n = max(1, self._n_logged_steps)
+        summary = {
+            "global_step": int(state.global_step),
+            "logged_steps": int(self._n_logged_steps),
+            "wall_clock_seconds": wall,
+            "sum_step_seconds": self._step_seconds_sum,
+            "mean_step_seconds": self._step_seconds_sum / n,
+            "sum_rollout_seconds": self._rollout_seconds_sum,
+            "mean_rollout_seconds": self._rollout_seconds_sum / n,
+            "rollout_fraction_of_step": (
+                (self._rollout_seconds_sum / self._step_seconds_sum)
+                if self._step_seconds_sum > 0
+                else None
+            ),
+            "train_runtime_from_logs": None,
+        }
+        # HF often puts train_runtime on the final log / trainer_state.
+        trainer = self._trainer()
+        if trainer is not None and getattr(trainer, "state", None) is not None:
+            hist = getattr(trainer.state, "log_history", None) or []
+            for row in reversed(hist):
+                if isinstance(row, dict) and "train_runtime" in row:
+                    try:
+                        summary["train_runtime_from_logs"] = float(row["train_runtime"])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        with self.summary_path.open("w") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"[opd-timing] wrote {self.summary_path}: {summary}", flush=True)
 
 
 @torch.no_grad()

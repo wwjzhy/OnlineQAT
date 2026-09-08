@@ -94,12 +94,16 @@ Resume notes:
   Raise --max-steps above the resumed global_step (e.g. 50 -> 100).
 
 OPD diagnostics (auto when --opd Stage 2 runs):
-  Per-step truncation / code-jump / grad_norm -> log/distill/<tag>/opd_step_metrics.jsonl
+  Per-step truncation / code-jump / grad_norm / rollout+step timing
+    -> log/distill/<tag>/opd_step_metrics.jsonl
+  Train-end summary (wall / mean rollout / mean step)
+    -> log/distill/<tag>/opd_timing_summary.json
   Merge with eval checkpoints:
     python scripts/merge_opd_timeline.py \\
       --metrics log/distill/<tag>/opd_step_metrics.jsonl \\
       --eval-root output/eval/<tag> \\
       --out-dir output/plots/<tag>
+  Exp status must report benchmark scores AND timing (see Exp.md 结果报告清单).
 EOF
 }
 
