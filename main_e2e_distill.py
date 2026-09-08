@@ -216,6 +216,7 @@ class PolicyGKDTrainer(GKDTrainer):
         self._pending_opd_rollout_metrics = {}
         self._pending_opd_jump_metrics = {}
         self._accum_opd_rollout_seconds = 0.0
+        self.min_rollout_tokens = 1
         self._pv_adv_clip_value = pv_adv_clip if pv_adv_clip > 0 else None
         self._pv_clip_last_step = None
         self._pv_metrics_last_step = None
@@ -493,6 +494,81 @@ class PolicyGKDTrainer(GKDTrainer):
     def training_step(self, model, inputs, num_items_in_batch=None):
         """OPD: roll out the student before applying sampled reverse KL."""
         if self.opd_mode:
+            prompts = inputs["prompts"]
+            prompt_attention_mask = inputs.get(
+                "prompt_attention_mask",
+                torch.ones_like(prompts),
+            )
+            max_length = int(
+                getattr(self.generation_config, "max_length", None)
+                or (getattr(self.args, "max_length", None) or prompts.shape[1])
+            )
+            min_rollout = int(getattr(self, "min_rollout_tokens", 1) or 1)
+            # Per-sample non-pad prompt lengths (left-padded).
+            prompt_lens = prompt_attention_mask.to(dtype=torch.long).sum(dim=-1)
+            keep = prompt_lens <= (max_length - min_rollout)
+            if not bool(keep.any().item()):
+                # No room to generate: skip microbatch without crashing HF validate.
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    labels=inputs.get("labels"),
+                )
+                loss = outputs.loss * 0.0
+                self._pending_opd_rollout_metrics = {
+                    "truncation_rate": 0.0,
+                    "mean_response_len": 0.0,
+                    "mean_seq_len": float(prompt_lens.float().mean().item()),
+                    "hit_max_length_rate": 1.0,
+                    "eos_rate": 0.0,
+                    "rollout_seconds": float(
+                        getattr(self, "_accum_opd_rollout_seconds", 0.0)
+                    ),
+                    "skipped_oversized_prompt": 1.0,
+                }
+                return loss
+
+            if not bool(keep.all().item()):
+                # Drop only the oversized rows; keep the rest of the microbatch.
+                idx = keep.nonzero(as_tuple=True)[0]
+                inputs = {
+                    key: (val.index_select(0, idx) if torch.is_tensor(val) else val)
+                    for key, val in inputs.items()
+                }
+                prompts = inputs["prompts"]
+                prompt_attention_mask = inputs["prompt_attention_mask"]
+
+            # Left-padded prompts keep the old width after dropping a long row; HF
+            # validates on tensor length, so crop to the longest remaining prompt.
+            max_prompt_len = int(prompt_attention_mask.sum(dim=-1).max().item())
+            if prompts.shape[1] > max_prompt_len:
+                prompts = prompts[:, -max_prompt_len:]
+                prompt_attention_mask = prompt_attention_mask[:, -max_prompt_len:]
+                inputs = dict(inputs)
+                inputs["prompts"] = prompts
+                inputs["prompt_attention_mask"] = prompt_attention_mask
+
+            if prompts.shape[1] > max_length - min_rollout:
+                # Still no generation room (e.g. batch width equals max_length).
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    labels=inputs.get("labels"),
+                )
+                loss = outputs.loss * 0.0
+                self._pending_opd_rollout_metrics = {
+                    "truncation_rate": 0.0,
+                    "mean_response_len": 0.0,
+                    "mean_seq_len": float(max_prompt_len),
+                    "hit_max_length_rate": 1.0,
+                    "eos_rate": 0.0,
+                    "rollout_seconds": float(
+                        getattr(self, "_accum_opd_rollout_seconds", 0.0)
+                    ),
+                    "skipped_oversized_prompt": 1.0,
+                }
+                return loss
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             rollout_t0 = time.perf_counter()
@@ -506,19 +582,11 @@ class PolicyGKDTrainer(GKDTrainer):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             rollout_seconds = float(time.perf_counter() - rollout_t0)
-            prompt_attention_mask = inputs.get(
-                "prompt_attention_mask",
-                torch.ones_like(inputs["prompts"]),
-            )
             new_attention_mask, new_labels = self.build_opd_masks(
                 generated_tokens=new_input_ids,
                 prompt_attention_mask=prompt_attention_mask,
                 eos_token_id=self.generation_config.eos_token_id,
                 pad_token_id=self.processing_class.pad_token_id,
-            )
-            max_length = int(
-                getattr(self.generation_config, "max_length", None)
-                or new_input_ids.shape[1]
             )
             local_metrics = rollout_truncation_metrics(
                 generated_tokens=new_input_ids,
@@ -535,6 +603,7 @@ class PolicyGKDTrainer(GKDTrainer):
             reduced["rollout_seconds"] = float(
                 getattr(self, "_accum_opd_rollout_seconds", 0.0) + rollout_seconds
             )
+            reduced["skipped_oversized_prompt"] = 0.0
             self._accum_opd_rollout_seconds = reduced["rollout_seconds"]
             self._pending_opd_rollout_metrics = reduced
             inputs = dict(inputs)
@@ -1342,6 +1411,12 @@ def main():
     )
     parser.add_argument("--optim", type=str, default="adamw_torch", help="optimizer")
     parser.add_argument("--max_length", type=int, default=None, help="maximum sequence length")
+    parser.add_argument(
+        "--min_rollout_tokens",
+        type=int,
+        default=1,
+        help="OPD: skip samples whose prompt leaves fewer than this many tokens under max_length",
+    )
     parser.add_argument("--per_device_train_batch_size", type=int, default=1, help="per device train batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="gradient accumulation steps")
     parser.add_argument("--dataset_size", type=int, default=1024, help="dataset size")
@@ -1707,6 +1782,7 @@ def main():
     )
     trainer_ref_holder["trainer"] = trainer
     trainer.warmup_start_lr = float(args.warmup_start_lr)
+    trainer.min_rollout_tokens = int(args.min_rollout_tokens)
     if use_fixed_warmup:
         logger.info(
             f"warmup_steps={args.warmup_steps} warmup_start_lr={args.warmup_start_lr} "
