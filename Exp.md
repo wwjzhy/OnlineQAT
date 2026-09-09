@@ -662,6 +662,99 @@ output/eval/Qwen3-1.7B-w2g128-reasoningqat
 
 ---
 
+## Exp #12（2026-09-09 新增）— 汇总 W2/W3 Stage1 + KD + ReasoningQAT 的**训练时间**与**是否收敛**
+
+**要求：** 不重训。对下面 6 档**已跑完或正在跑的**实验，从 log / `trainer_state.json` 抽出墙钟与 loss，填表；判断每档是否看起来收敛。硬件一行写清（如 8×H20）。本实验是**事后统计**，不是新训练。
+
+| 档 | 对应 Exp | 日志 / 产出 tag |
+|--|--|--|
+| **W3-Stg1** | `#1` / `#9` 共用 Stage 1 | `log/block_qat/Qwen3-1.7B-w3g128`，`output/block_qat/Qwen3-1.7B-w3g128` |
+| **W3-KD** | `#1` 离线 GKD（plain CE+JSD） | `log/distill/Qwen3-1.7B-w3g128` |
+| **W3-ReasoningQAT** | `#9` | `log/distill/Qwen3-1.7B-w3g128-reasoningqat` |
+| **W2-Stg1** | `#4` / `#11` 共用 Stage 1 | `log/block_qat/Qwen3-1.7B-w2g128` |
+| **W2-KD** | `#4` 离线 GKD | `log/distill/Qwen3-1.7B-w2g128` |
+| **W2-ReasoningQAT** | `#11` | `log/distill/Qwen3-1.7B-w2g128-reasoningqat` |
+
+### 时间怎么读
+
+**Stage 2（KD / ReasoningQAT）：**
+
+```bash
+# train_runtime（秒）+ 最终 loss
+python - <<'PY'
+import json
+from pathlib import Path
+for tag in [
+  "Qwen3-1.7B-w3g128",
+  "Qwen3-1.7B-w3g128-reasoningqat",
+  "Qwen3-1.7B-w2g128",
+  "Qwen3-1.7B-w2g128-reasoningqat",
+]:
+    p = Path(f"log/distill/{tag}/trainer_state.json")
+    if not p.exists():
+        # resume 时也可能在 checkpoint-* 下
+        cands = sorted(Path(f"log/distill/{tag}").glob("checkpoint-*/trainer_state.json"))
+        p = cands[-1] if cands else None
+    print("====", tag)
+    if not p or not p.exists():
+        print("MISSING"); continue
+    st = json.loads(p.read_text())
+    hist = st.get("log_history", [])
+    runtime = next((h.get("train_runtime") for h in reversed(hist) if "train_runtime" in h), None)
+    losses = [h["loss"] for h in hist if "loss" in h]
+    print("global_step", st.get("global_step"), "train_runtime_s", runtime,
+          "hours", None if runtime is None else round(runtime/3600, 2))
+    if losses:
+        n = max(1, len(losses)//10)
+        print("loss_first_avg", round(sum(losses[:n])/n, 4),
+              "loss_last_avg", round(sum(losses[-n:])/n, 4),
+              "loss_min", round(min(losses), 4), "n_logged", len(losses))
+PY
+```
+
+也可用训练 shell 起止时间 / `log/distill/<tag>/*.log` 时间戳交叉核对。填表时写：**墙钟小时、GPU 数、总 step（W3 KD/RQ≈512；W2 KD/RQ≈1536）、sec/step**。
+
+**Stage 1（block QAT）：** 看 `log/block_qat/<tag>/` 里 logger 起止、或脚本打印的 quantization wall time；没有 `train_runtime` 字段时用日志时间戳差。注明 **1 GPU**（Stage 1 不能 8 卡）。
+
+### 收敛能不能从 loss 看出来？
+
+**能看个大概，但不能单靠 loss 定论。**
+
+| | 能看什么 | 局限 |
+|--|--|--|
+| Stage 2 loss 曲线 | 前半是否下降、后半是否走平、有无后期炸/震荡 | 不同方法 loss 尺度不同（JSD vs forward_kl），**不能跨方法比绝对 loss**；cosine 末期会再掉一点，不等于「没收敛」 |
+| Stage 1 | 按层 recon / block loss 是否下降 | 是 block-wise，和 Stage 2 不可比 |
+| 更可靠 | 同设定下 eval（GSM/MATH 等）随 step 是否稳住 | loss 降但评测掉 = 过拟合/分布漂，仍算「优化收敛、任务未稳」 |
+
+**判定口径（写入状态）：**
+
+1. **看起来收敛：** 后 20% step 的平均 loss ≤ 前 20% 的平均 loss，且后半无持续上升/剧烈尖峰  
+2. **可疑 / 未收敛：** 后期 loss 回升、NaN、或中途挂掉未跑满 step  
+3. **仅 loss 不足：** 若只有 final loss 没有曲线，标「无法判断」，去补 `log_history` 或 eval
+
+填表模板（状态里贴齐）：
+
+| 档 | 墙钟 | GPU | steps | sec/step | loss 前→后 | 收敛判定 |
+|--|--|--|--|--|--|--|
+| W3-Stg1 | | 1 | | | | |
+| W3-KD | | 8 | ~512 | | | |
+| W3-ReasoningQAT | | 8 | ~512 | | | |
+| W2-Stg1 | | 1 | | | | |
+| W2-KD | | 8 | ~1536 | | | |
+| W2-ReasoningQAT | | 8 | ~1536 | | | |
+
+**依赖：** 上表 6 档在**训练集群**上的 `log/`（本机 `/zju_0038` 可能只有空壳，以实际跑完的机器为准）。
+
+**状态：** 未填。本仓库当前几乎无 `trainer_state.json`；到有完整 `log/distill` / `log/block_qat` 的机器上跑上面的脚本后，把表填回本节。
+
+产出：
+
+```
+output/plots/train_time_convergence_w2w3.md   # 可选：把填好的表另存一份
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
