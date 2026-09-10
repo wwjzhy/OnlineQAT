@@ -755,6 +755,73 @@ output/plots/train_time_convergence_w2w3.md   # 可选：把填好的表另存�
 
 ---
 
+## Exp #13（2026-09-10 新增）— 汇总 **W2-OPD 100 step** 与 **W3-OPD 50 step** 的逐步诊断
+
+**要求：** 不重训、**不要 PV-OPD**。只统计标准 OPD 两档：W2 按 100 optimizer step、W3 按 50 step。按文末「OPD 逐步诊断」收齐 log、merge、出图，把摘要填回本节。`#12` 管离线 Stage1/KD/RQ；**本实验只管这两条 OPD 曲线**。只报最终 GSM、不交 timeline / 时间，算没做完。
+
+字段口径见文末「OPD 逐步诊断」：`truncation_rate` = response 无 EOS **且** 顶满当时的 `max_length`；跳码 = 相邻 step 整数码变化比例。旧 run 若没有 `opd_step_metrics.jsonl`，状态写 **无 JSONL**，能从 `trainer_state.json` / eval checkpoint 补多少补多少，不要假装有逐步跳码。
+
+W3 的 `#2` 原文是满 epoch Stage 2；**本统计只取前 50 step**（JSONL / `log_history` / eval checkpoint 截到 step≤50）。W2 **固定用 `#10`**（100 step、`2e-6`+wu30 后恒定峰值），不要用 `#5` 默认 `5e-6`，也不要把 `#6` PV-OPD、`#7/#8` 的 50-step 消融写进本表。
+
+| 档 | 统计步数 | tag |
+|--|--|--|
+| **W2-OPD** | **100** | `#10` `Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold` |
+| **W3-OPD** | **50** | `#2` `Qwen3-1.7B-w3g128-opd`（只分析 step 1–50） |
+
+某档没跑到指定步数：写实际 `global_step`，不要拿别的 W2 tag 充数。
+
+### 怎么收
+
+```bash
+# W2 100 step = Exp #10
+TAG=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+python scripts/merge_opd_timeline.py \
+  --metrics log/distill/${TAG}/opd_step_metrics.jsonl \
+  --eval-root output/eval/${TAG} \
+  --out-dir output/plots/${TAG}
+cat log/distill/${TAG}/opd_timing_summary.json
+
+# W3 50 step = Exp #2（merge 后作图/填表只用 step<=50）
+TAG=Qwen3-1.7B-w3g128-opd
+python scripts/merge_opd_timeline.py \
+  --metrics log/distill/${TAG}/opd_step_metrics.jsonl \
+  --eval-root output/eval/${TAG} \
+  --out-dir output/plots/${TAG}
+```
+
+每档至少画（W3 横轴只到 50）：truncation（可叠 eos / response 长）、code-jump + amplification、grad_norm（可叠 lr）、GSM8K / MATH-500。图放 `output/plots/<tag>/`。
+
+### 填表（状态里贴齐）
+
+逐步量取 **起 / 中 / 末**（W2：约 step 1 / 50 / 100；W3：约 1 / 25 / 50）。时间优先 `opd_timing_summary.json`（W3 若跑过 50 step，注明 wall 是全程还是按 50 step 比例估算）。
+
+| 档 | 实际 steps | JSONL | wall / s/step | mean rollout (占比) | trunc 起→末 | jump 起→末 | amp | GSM 起→末 | 判定 |
+|--|--|--|--|--|--|--|--|--|--|
+| W2-OPD `#10` | 目标 100 | | | | | | | | |
+| W3-OPD `#2` | 目标 50 | | | | | | | | |
+
+**判定口（写入状态，可多选）：**
+
+- **策略塌：** truncation / 无 EOS 升高，response 顶满预算  
+- **跳码不稳：** jump 高且 GSM 振荡  
+- **W2 vs W3：** 同 OPD、不同 bit，100 vs 50 step 下 truncation / jump / rollout 占比差在哪  
+- **rollout 太贵：** `rollout_fraction_of_step` 很高  
+- **无诊断 log：** 代码早于 JSONL，只能看 eval 点
+
+**依赖：** 训练集群上对应 `log/distill/<tag>` 与 `output/eval/<tag>`。
+
+**状态：** 未填。到有产物的机器上 merge + 出图后，把表和路径写回本节。
+
+产出：
+
+```
+output/plots/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/
+output/plots/Qwen3-1.7B-w3g128-opd/
+output/plots/opd_diagnostics_w2_100_w3_50.md
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
