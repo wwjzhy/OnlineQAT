@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -17,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GenerationConfig
 
-from main_e2e_distill import PolicyGKDTrainer
+from main_e2e_distill import PolicyGKDTrainer, scheduler_type_name
 from trl.trainer.gkd_trainer import GKDTrainer
 
 
@@ -288,6 +289,8 @@ def test_scripts_gkd_vs_opd_flags():
     assert "-reasoningqat" in rqat
     assert "--use_teacher_weight" not in gkd
     assert "--kd_loss_type forward_kl" not in gkd
+    assert "--exp-name" in gkd
+    assert "--exp-name" in rqat
 
 
 def test_policy_trainer_beta_default_is_none():
@@ -371,6 +374,54 @@ def test_underflow_debug_not_enabled_for_opd():
     assert 'debug="underflow_overflow"' not in src
 
 
+def _opd_lr_scheduler(sched_type, warmup_start_lr=2e-7, warmup_steps=30, peak=2e-6, steps=100):
+    param = nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([param], lr=peak)
+    trainer = PolicyGKDTrainer.__new__(PolicyGKDTrainer)
+    trainer.args = SimpleNamespace(
+        warmup_steps=warmup_steps,
+        learning_rate=peak,
+        lr_scheduler_type=sched_type,
+    )
+    trainer.warmup_start_lr = warmup_start_lr
+    trainer.optimizer = opt
+    return PolicyGKDTrainer.create_scheduler(trainer, num_training_steps=steps, optimizer=opt)
+
+
+def test_scheduler_type_name_strips_hf_enum():
+    from transformers.trainer_utils import SchedulerType
+
+    assert scheduler_type_name("constant_with_warmup") == "constant_with_warmup"
+    assert scheduler_type_name(SchedulerType.CONSTANT_WITH_WARMUP) == "constant_with_warmup"
+    # This is the bug Exp #10 hit: str(enum) is not the HF value.
+    assert str(SchedulerType.CONSTANT_WITH_WARMUP) == "SchedulerType.CONSTANT_WITH_WARMUP"
+    assert str(SchedulerType.CONSTANT_WITH_WARMUP) not in (
+        "constant",
+        "constant_with_warmup",
+    )
+
+
+def test_constant_with_warmup_holds_peak_with_warmup_start_lr():
+    from transformers.trainer_utils import SchedulerType
+
+    sched = _opd_lr_scheduler(SchedulerType.CONSTANT_WITH_WARMUP)
+    lam = sched.lr_lambdas[0]
+    assert lam(0) < 0.2
+    assert abs(lam(30) - 1.0) < 1e-12
+    assert abs(lam(61) - 1.0) < 1e-12
+    assert abs(lam(99) - 1.0) < 1e-12
+
+
+def test_linear_still_decays_after_warmup_start_lr():
+    sched = _opd_lr_scheduler("linear")
+    lam = sched.lr_lambdas[0]
+    assert abs(lam(30) - 1.0) < 1e-12
+    # Matches Exp #10's observed 2e-6 * (1 - (t-30)/70) at logged step 99
+    # (LambdaLR last_epoch is 0-indexed → 98).
+    assert abs(lam(98) - (2.0 / 70.0)) < 1e-12
+    assert lam(99) < 0.05
+
+
 if __name__ == "__main__":
     tests = [
         test_jsd_identical_is_zero,
@@ -390,6 +441,9 @@ if __name__ == "__main__":
         test_opd_generate_runs_in_eval_then_restores_train,
         test_cached_fake_quant_matches_live_forward,
         test_underflow_debug_not_enabled_for_opd,
+        test_scheduler_type_name_strips_hf_enum,
+        test_constant_with_warmup_holds_peak_with_warmup_start_lr,
+        test_linear_still_decays_after_warmup_start_lr,
     ]
     for fn in tests:
         fn()

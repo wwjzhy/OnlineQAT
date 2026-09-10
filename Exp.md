@@ -822,6 +822,190 @@ output/plots/opd_diagnostics_w2_100_w3_50.md
 
 ---
 
+## Exp #14（2026-09-10 新增）— Qwen3-**4B** 复现 1.7B 的六档：W3/W2 × Stg1 / KD / ReasoningQAT
+
+**要求：** 把 1.7B 上已经对齐的离线六档原样换到 **Qwen3-4B**。只改模型；**其余超参与对应 1.7B Exp 相同**。不要 OPD，不要 `--train-emb`。产出 stem 必须是 `Qwen3-4B`，**不要覆盖** 1.7B 的 `Qwen3-1.7B-w*g128*`。本实验覆盖公共约定里的「模型是 1.7B」以及 W2 时「不要把 `--wbits` 改成 2」。
+
+| 档 | 对齐的 1.7B Exp | 脚本 | bits | Stage 2 loss | Stage 1 lr | Stage 2 lr / epoch | 产出 |
+|--|--|--|--|--|--|--|--|
+| **W3-Stg1** | `#1/#9` Stage 1 | 任一带 `--stage 1` | 3 | — | `1e-5` | — | `Qwen3-4B-w3g128` |
+| **W3-KD** | `#1` | `run_qwen3_1.7b.sh` | 3 | plain CE + JSD | 同上 | `1e-6` / 1（512 step） | `Qwen3-4B-w3g128` |
+| **W3-ReasoningQAT** | `#9` | `run_qwen3_1.7b_reasoningqat.sh` | 3 | teacher-weighted CE + `forward_kl` + cosine | 同上 | `1e-6` / 1 | `Qwen3-4B-w3g128-reasoningqat` |
+| **W2-Stg1** | `#4/#11` Stage 1 | `--wbits 2 --stage 1` | 2 | — | `2e-5` | — | `Qwen3-4B-w2g128` |
+| **W2-KD** | `#4` | `run_qwen3_1.7b.sh --wbits 2` | 2 | plain CE + JSD | 同上 | `5e-6` / 3（1536 step） | `Qwen3-4B-w2g128` |
+| **W2-ReasoningQAT** | `#11` | `run_qwen3_1.7b_reasoningqat.sh --wbits 2` | 2 | 同 `#9` | 同上 | `5e-6` / 3 | `Qwen3-4B-w2g128-reasoningqat` |
+
+锁死与 1.7B 相同：OpenThoughts 32768、effective batch **64**、`max_length=8192`、`top_k=20`、**8 卡** Stage 2（`--gpus 0,1,2,3,4,5,6,7`，accum=8）、Stage 1 单卡。Teacher = 同一份 BF16 Qwen3-4B。不要改 batch / lr / epoch。
+
+**依赖：** 8 卡集群上的 Qwen3-4B 目录（须有 `config.json`）。`MODEL` 按那台机器改，不要照抄本仓库默认的 1.7B 路径。不读 1.7B 的 Stage 1。
+
+**状态：** 未跑。脚本已加 `--exp-name`（默认仍 `Qwen3-1.7B`）。4B **必须** `--exp-name Qwen3-4B`，否则会拒绝以免覆盖 1.7B。Stage 2 若 8192 OOM：该次命令加 `--max-length 4096` 并在状态里注明，不要默默改 batch。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+MODEL=/改成8卡集群上的/Qwen3-4B
+test -f "${MODEL}/config.json"
+
+# --- W3 ---
+# Stg1（#1 与 #9 共用）
+bash scripts/run_qwen3_1.7b.sh --wbits 3 --stage 1 \
+  --model "${MODEL}" --teacher "${MODEL}" --exp-name Qwen3-4B
+
+# Stg1 评测（对齐 #3）
+CUDA_VISIBLE_DEVICES="${CONVERT_GPU:-0}" python scripts/convert_to_hf_vllm_compatible_model.py \
+  --base-id ./output/block_qat/Qwen3-4B-w3g128 \
+  --save-dir ./output/vllm/Qwen3-4B-w3g128-blockqat \
+  --wbits 3 --group-size 128
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-4B-w3g128-blockqat \
+  ./output/eval/Qwen3-4B-w3g128-blockqat
+
+# W3-KD（#1）
+bash scripts/run_qwen3_1.7b.sh --wbits 3 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --model "${MODEL}" --teacher "${MODEL}" --exp-name Qwen3-4B
+bash scripts/run_qwen3_1.7b.sh --wbits 3 --stage 3 \
+  --model "${MODEL}" --exp-name Qwen3-4B
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-4B-w3g128 \
+  ./output/eval/Qwen3-4B-w3g128
+
+# W3-ReasoningQAT（#9；复用上面这份 Stage 1，不要重训）
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 3 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --model "${MODEL}" --teacher "${MODEL}" --exp-name Qwen3-4B
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 3 --stage 3 \
+  --model "${MODEL}" --exp-name Qwen3-4B
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-4B-w3g128-reasoningqat \
+  ./output/eval/Qwen3-4B-w3g128-reasoningqat
+
+# --- W2 ---
+bash scripts/run_qwen3_1.7b.sh --wbits 2 --stage 1 \
+  --model "${MODEL}" --teacher "${MODEL}" --exp-name Qwen3-4B
+
+CUDA_VISIBLE_DEVICES="${CONVERT_GPU:-0}" python scripts/convert_to_hf_vllm_compatible_model.py \
+  --base-id ./output/block_qat/Qwen3-4B-w2g128 \
+  --save-dir ./output/vllm/Qwen3-4B-w2g128-blockqat \
+  --wbits 2 --group-size 128
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-4B-w2g128-blockqat \
+  ./output/eval/Qwen3-4B-w2g128-blockqat
+
+bash scripts/run_qwen3_1.7b.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --model "${MODEL}" --teacher "${MODEL}" --exp-name Qwen3-4B
+bash scripts/run_qwen3_1.7b.sh --wbits 2 --stage 3 \
+  --model "${MODEL}" --exp-name Qwen3-4B
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-4B-w2g128 \
+  ./output/eval/Qwen3-4B-w2g128
+
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --model "${MODEL}" --teacher "${MODEL}" --exp-name Qwen3-4B
+bash scripts/run_qwen3_1.7b_reasoningqat.sh --wbits 2 --stage 3 \
+  --model "${MODEL}" --exp-name Qwen3-4B
+bash scripts/eval_paper_benchmarks.sh \
+  ./output/vllm/Qwen3-4B-w2g128-reasoningqat \
+  ./output/eval/Qwen3-4B-w2g128-reasoningqat
+```
+
+建议顺序：W3-Stg1 → 评 Stg1 → W3-KD 与 W3-RQ 可并行（同 Stage 1）→ 同样做 W2。训完按 `#12` 口径记墙钟 / loss。
+
+产出：
+
+```
+output/block_qat/Qwen3-4B-w3g128
+output/distill/Qwen3-4B-w3g128
+output/distill/Qwen3-4B-w3g128-reasoningqat
+output/block_qat/Qwen3-4B-w2g128
+output/distill/Qwen3-4B-w2g128
+output/distill/Qwen3-4B-w2g128-reasoningqat
+output/eval/Qwen3-4B-w3g128-blockqat
+output/eval/Qwen3-4B-w3g128
+output/eval/Qwen3-4B-w3g128-reasoningqat
+output/eval/Qwen3-4B-w2g128-blockqat
+output/eval/Qwen3-4B-w2g128
+output/eval/Qwen3-4B-w2g128-reasoningqat
+```
+
+和 1.7B 同名后缀的 eval 对比。不要覆盖 `Qwen3-1.7B-*`。
+
+---
+
+## Exp #15（2026-09-10 新增）— 从 `#10` 的 **step 30** 起 hold `2e-6` 把后面跑完
+
+**要求：** `#10` 前 30 step warmup（`2e-7→2e-6`）是对的，从 31 起本应 **钉住 `2e-6`**，实际在 decay。本实验 **不要重训 1–30，也不要从 100 接着训**。在 **跑 `#10` 的那台 8 卡集群**上，用修好 hold 的代码，从 `#10` 的 Trainer **`checkpoint-30`** 续跑到 100（原来设计的 70 步 stable）。不要 `--train-emb`，不要重训 Stage 1。`--run-suffix from30hold` 写到新目录，**不要覆盖** `#10` 已经 decay 的 31–100。本实验覆盖公共约定里的「不要把 `--wbits` 改成 2」。
+
+| | `#10` | **本实验 `#15`** |
+|--|--|--|
+| step 1–30 | warmup 到 `2e-6`（保留） | **不重跑，加载 8 卡机上的 ckpt-30** |
+| step 31–100 | 实际 linear → 0 | **hold `2e-6` 跑完这 70 步** |
+| 起点 | Stage 1 | **`#10` 的 step 30** |
+| 产出 | `…-schhold` | **`…-schhold-from30hold`** |
+
+其余与 `#10` 相同：W2、CE=0、sampled reverse KL、8 卡、batch 64、`max_length=8192`、每 5 step 存 ckpt。`--max-steps 100`（从 global_step=30 训到 100）。不要 `--resume`（会捡 step 100）。必须 `--resume-from log/distill/<tag10>/checkpoint-30`。
+
+**开训前闸门：**
+
+1. 在 8 卡集群拉到含 `scheduler_type_name` 的代码；rank0 要出现 `hold_after_warmup=True`，否则停。
+2. `test -d log/distill/${TAG10}/checkpoint-30` 必须过（Trainer 全量，不是 `output/distill` 评测快照）。没有就停下来找，不要改成 `--init-from`。
+3. 续训后 step 35 / 50 / 75 / 100 的 `learning_rate` 都必须 ≈ `2e-6`。再掉下去作废。
+
+**依赖：** 8 卡集群上的 `#4` Stage 1，以及 `#10` 的 `log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-30`。
+
+**状态：** 未跑。在 8 卡机上跑。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+TAG10=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+TAG15=${TAG10}-from30hold
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+test -d log/distill/${TAG10}/checkpoint-30
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 100 --save-steps 5 \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --resume-from log/distill/${TAG10}/checkpoint-30 \
+  --run-suffix from30hold
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/${TAG15} \
+  --wbits 2 --eval-gpu 0 \
+  --steps 35,50,75,100 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics log/distill/${TAG15}/opd_step_metrics.jsonl \
+  --eval-root output/eval/${TAG15} \
+  --out-dir output/plots/${TAG15}
+```
+
+横幅：`Resuming training from checkpoint` 指向 **checkpoint-30**（不是 100）、`max_steps=100`、`hold_after_warmup=True`。`learning_rate` 从 31 到 100 应是 `2e-6` 平线。
+
+产出：
+
+```
+output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+output/eval/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+output/plots/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+```
+
+对比同一 step 的 `#10`（decay）vs 本实验（hold）。不要覆盖 `#10` 的 `…-schhold`。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：

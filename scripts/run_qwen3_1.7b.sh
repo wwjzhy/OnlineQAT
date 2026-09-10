@@ -37,6 +37,9 @@ GROUP_SIZE=128
 STAGE="all"
 TRAIN_EMB=0
 SKIP_EXISTING=0
+EXP_NAME_STEM="Qwen3-1.7B"
+MODEL_CLI=0
+TEACHER_CLI=0
 
 MODEL="${MODEL_PATH:-/zju_0038/zq/models/Qwen3-1.7B}"
 TEACHER="${TEACHER_MODEL:-${MODEL}}"
@@ -74,6 +77,7 @@ Options:
   --max-length N         Distill sequence length (default: 8192; use 4096 on A100-40GB if OOM)
   --model PATH           Student / base model (default: /zju_0038/zq/models/Qwen3-1.7B)
   --teacher PATH         Teacher model for Stage 2 (default: same as --model)
+  --exp-name STEM        Output tag stem (default: Qwen3-1.7B → STEM-w{2|3}g128)
   --train-emb            Also train embed_tokens in Stage 2
   --skip-existing        Skip a stage if its output dir already has config.json
   -h, --help             Show this help
@@ -99,8 +103,9 @@ while [[ $# -gt 0 ]]; do
     --gpus) DISTILL_GPUS="$2"; shift 2 ;;
     --block-gpu) BLOCK_GPU="$2"; shift 2 ;;
     --max-length) MAX_LENGTH="$2"; shift 2 ;;
-    --model) MODEL="$2"; shift 2 ;;
-    --teacher) TEACHER="$2"; shift 2 ;;
+    --model) MODEL="$2"; MODEL_CLI=1; shift 2 ;;
+    --teacher) TEACHER="$2"; TEACHER_CLI=1; shift 2 ;;
+    --exp-name) EXP_NAME_STEM="$2"; shift 2 ;;
     --train-emb) TRAIN_EMB=1; shift ;;
     --skip-existing) SKIP_EXISTING=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -116,8 +121,20 @@ if [[ "${STAGE}" != "all" && "${STAGE}" != "1" && "${STAGE}" != "2" && "${STAGE}
   echo "--stage must be all|1|2|3, got ${STAGE}" >&2
   exit 1
 fi
+# --model on CLI wins over a stale TEACHER_MODEL (often still 1.7B in env).
+if [[ "${TEACHER_CLI}" -eq 0 && "${MODEL_CLI}" -eq 1 ]]; then
+  TEACHER="${MODEL}"
+fi
 if [[ ! -f "${MODEL}/config.json" ]]; then
   echo "Model not found: ${MODEL}" >&2
+  exit 1
+fi
+if [[ "${MODEL}" == *4B* && "${EXP_NAME_STEM}" == "Qwen3-1.7B" ]]; then
+  echo "Refusing: 4B model but --exp-name is still Qwen3-1.7B (would overwrite 1.7B outputs). Pass --exp-name Qwen3-4B." >&2
+  exit 1
+fi
+if [[ "${MODEL}" == *4B* && "${TEACHER}" == *1.7B* ]]; then
+  echo "Refusing: 4B student with 1.7B teacher ${TEACHER}. Pass --teacher to the same 4B checkpoint." >&2
   exit 1
 fi
 
@@ -132,7 +149,7 @@ else
   DISTILL_EPOCHS=1
 fi
 
-EXP_NAME="Qwen3-1.7B-w${WBITS}g${GROUP_SIZE}"
+EXP_NAME="${EXP_NAME_STEM}-w${WBITS}g${GROUP_SIZE}"
 if [[ "${TRAIN_EMB}" -eq 1 ]]; then
   DISTILL_TAG="${EXP_NAME}-trainemb"
 else
@@ -202,8 +219,8 @@ if [[ "${TRAIN_EMB}" -eq 1 ]]; then
 fi
 
 echo "============================================================"
-echo "Qwen3-1.7B ReasoningQAT (GKD)"
-echo "  wbits=${WBITS}  group_size=${GROUP_SIZE}  stage=${STAGE}"
+echo "${EXP_NAME_STEM} ReasoningQAT (GKD)"
+echo "  exp_name=${EXP_NAME}  wbits=${WBITS}  group_size=${GROUP_SIZE}  stage=${STAGE}"
 echo "  model=${MODEL}"
 echo "  teacher=${TEACHER}"
 echo "  python=${PY}"

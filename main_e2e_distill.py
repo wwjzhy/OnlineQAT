@@ -173,6 +173,23 @@ def DFTCausalLMLoss(
 
     return loss
 
+
+def scheduler_type_name(sched) -> str:
+    """HF stores ``lr_scheduler_type`` as ``SchedulerType``; ``str(enum)`` is
+    ``'SchedulerType.CONSTANT_WITH_WARMUP'``, which must not be used for matching.
+    """
+    if sched is None:
+        return "linear"
+    value = getattr(sched, "value", None)
+    if isinstance(value, str) and value:
+        raw = value
+    else:
+        raw = str(sched)
+        if raw.startswith("SchedulerType."):
+            raw = raw.split(".", 1)[1]
+    return raw.strip().lower().replace("-", "_")
+
+
 class PolicyGKDTrainer(GKDTrainer):
     def __init__(
         self,
@@ -635,13 +652,19 @@ class PolicyGKDTrainer(GKDTrainer):
         warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
         start_lr = float(getattr(self, "warmup_start_lr", 0.0) or 0.0)
         peak_lr = float(self.args.learning_rate)
-        sched = str(getattr(self.args, "lr_scheduler_type", "linear") or "linear")
+        sched = scheduler_type_name(getattr(self.args, "lr_scheduler_type", "linear"))
         hold_after_warmup = sched in ("constant", "constant_with_warmup")
         # Non-zero warmup start needs a custom lambda; otherwise defer to HF.
         if warmup_steps <= 0 or start_lr <= 0.0 or peak_lr <= 0.0:
             return super().create_scheduler(num_training_steps, optimizer=optimizer)
 
         start_factor = min(1.0, start_lr / peak_lr)
+        print(
+            f"[lr] custom warmup_start_lr={start_lr} peak={peak_lr} "
+            f"warmup_steps={warmup_steps} schedule={sched} "
+            f"hold_after_warmup={hold_after_warmup}",
+            flush=True,
+        )
 
         def lr_lambda(current_step: int):
             if current_step < warmup_steps:
