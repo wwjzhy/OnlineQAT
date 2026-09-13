@@ -1006,6 +1006,58 @@ output/plots/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
 
 ---
 
+## Exp #16（2026-09-11 新增）— BF16 Qwen3-1.7B **thinking on** 的 GSM8K 上界
+
+**要求：** 评 **未量化、未训练** 的 BF16 `Qwen3-1.7B` 原模，**必须开 thinking**。用来当 `#10` / `#15` 以及后续量化实验的 teacher 上界。不要训练，不要 Stage 1/2，不要 convert，不要 `--train-emb`。只跑评测。本实验覆盖公共约定里「评的是量化产出」：这里评的是 `$MODEL_PATH` 原权重。
+
+协议与公共约定相同：`eval_paper_benchmarks.sh` + vLLM + evalscope，`T=0.6`，`top_k=20`，`max_tokens=8192`。**必须** `ENABLE_THINKING=1`。**不要**用 `scripts/eval_gsm8k_aime120.py`（那条是 thinking off + greedy + 2048）。
+
+| | OPT-QAT S0（已有，**不是本实验**） | **本实验 `#16`** |
+|--|--|--|
+| 模型 | 同一份 BF16 `Qwen3-1.7B` | **相同** |
+| thinking | **关** | **开** |
+| 采样 | greedy，`max_new_tokens=2048` | **T=0.6 / top_k=20 / 8192**（公共约定） |
+| 任务 | GSM8K 75.7%（999/1319） | **GSM8K 全量 1319**（必做） |
+| 产出 | `OPT-QAT/outputs/eval_qwen3_1p7b_s0_bf16` | **`output/eval/Qwen3-1.7B-bf16-thinking`** |
+
+主交付是 GSM8K。有余力再把 `EVAL_DATASETS` 改成 `gsm8k math_500`，不要一上来跑满 8 项。单卡即可，不要占满 8 卡。
+
+**开跑后闸门：** 前几条 generation 必须出现 `<think>`。没有就停，不要把 thinking-off 的分数写进状态。
+
+**依赖：** `$MODEL_PATH/config.json`（BF16 原模）。无训练产物依赖。
+
+**状态：** 未跑。这台 4 卡机（`ajv59d3mbdufs-0`）经常被占满，**不要抢别人的卡**。到有 **1 张空闲 GPU** 的机器上跑（8 卡集群空 1 张即可）。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+test -f "${MODEL_PATH}/config.json"
+
+# 只占 1 张空闲卡。把 0 改成 nvidia-smi 里空的那张。
+export CUDA_VISIBLE_DEVICES=0
+
+ENABLE_THINKING=1 \
+EVAL_DATASETS=gsm8k \
+MAX_TOKENS=8192 \
+EVAL_BATCH_SIZE=16 \
+  bash scripts/eval_paper_benchmarks.sh \
+  "${MODEL_PATH}" \
+  ./output/eval/Qwen3-1.7B-bf16-thinking
+```
+
+横幅应有 `enable_thinking=1`、`datasets: gsm8k`、`max_tokens=8192`。产出不要覆盖任何 `Qwen3-1.7B-w*` 的 eval。
+
+产出：
+
+```
+output/eval/Qwen3-1.7B-bf16-thinking
+```
+
+对比：OPT-QAT S0 的 thinking-off 75.7%；以及 `#10` 量化后的 GSM8K 曲线。状态里写 GSM8K 分 + 评测墙钟 + 是否确认过 `<think>`。没有 Stage 2，不必交 OPD timeline。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：

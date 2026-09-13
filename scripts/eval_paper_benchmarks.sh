@@ -23,6 +23,7 @@
 #   EVAL_DATASETS       space-separated dataset override
 #   VLLM_API_URL        skip serve; eval against this OpenAI base (…/v1)
 #   SERVED_MODEL_NAME   must match vLLM --served-model-name if VLLM_API_URL is set
+#   ENABLE_THINKING     1: force Qwen3 thinking on via extra_body (default unset = vLLM template default)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -133,9 +134,15 @@ else
   wait_for_vllm "${API_URL}" "${VLLM_PID}"
 fi
 
+EXTRA_BODY='{"top_k": 20}'
+if [[ "${ENABLE_THINKING:-}" == "1" ]]; then
+  EXTRA_BODY='{"top_k": 20, "enable_thinking": true, "chat_template_kwargs": {"enable_thinking": true}}'
+fi
+
 echo "eval  model=${SERVED_MODEL_NAME}"
 echo "  hub=modelscope  datasets: ${DATASETS[*]}"
 echo "  gen: T=0.6 top_k=20 max_tokens=${MAX_TOKENS}"
+echo "  enable_thinking=${ENABLE_THINKING:-unset}"
 echo "  eval_batch_size=${EVAL_BATCH_SIZE}  work_dir=${WORK_DIR}"
 
 EVAL_CMD=(
@@ -148,7 +155,7 @@ EVAL_CMD=(
   --dataset-hub modelscope
   --dataset-args '{"live_code_bench": {"subset_list": ["release_latest"]}}'
   --eval-batch-size "${EVAL_BATCH_SIZE}"
-  --generation-config "{\"temperature\": 0.6, \"top_k\": 20, \"max_tokens\": ${MAX_TOKENS}, \"timeout\": 3600, \"extra_body\": {\"top_k\": 20}}"
+  --generation-config "{\"temperature\": 0.6, \"top_k\": 20, \"max_tokens\": ${MAX_TOKENS}, \"timeout\": 3600, \"extra_body\": ${EXTRA_BODY}}"
   --work-dir "${WORK_DIR}"
   --ignore-errors
 )
