@@ -957,7 +957,69 @@ output/eval/Qwen3-4B-w2g128-reasoningqat
 
 **依赖：** 8 卡集群上的 `#4` Stage 1，以及 `#10` 的 `log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-30`。
 
-**状态：** 未跑。在 8 卡机上跑。
+**状态（2026-09-14）：** 已从 `#10 checkpoint-30` 续训到 **step 62/100**；
+hold 修复生效，step 31–62 的 `learning_rate=2e-6`。但三次重试都在即将进入
+step 63 时卡在同一个 DDP `ALLREDUCE`，最终由 2 h watchdog 退出。卡死前
+`truncation_rate=0`、loss/grad_norm 有限，无 NaN，不按梯度爆炸处理。
+
+**已定位根因：** selected OpenThoughts 中存在 tokenized prompt length
+`>=8192` 的样本；在 `max_length=8192`、`min_rollout_tokens=1` 下没有任何
+response 生成空间。当前 `PolicyGKDTrainer.training_step` 只让拿到该样本的
+本地 rank 提前 `return loss`，该 rank 没有执行 backward，其他 rank 继续进入
+梯度 `ALLREDUCE`，因此确定性死锁。日志里报 timeout 的 rank 不一定是拿到
+超长 prompt 的 rank。
+
+**修复与续训要求（覆盖下面原始“从 checkpoint-30 开跑”的命令）：**
+
+1. 在创建 Trainer / DistributedSampler **之前**，用与 collator 相同的 chat
+   template 和 tokenizer 计算 prompt-only 长度，统一过滤
+   `prompt_length >= 8192`（一般式：`prompt_length > max_length - min_rollout_tokens`）。
+   不要按原始字符串长度过滤，也不要把 gold completion 算进 prompt 长度。
+2. 所有 rank 必须看到同一份过滤后的 dataset。启动日志写出过滤前后样本数、
+   删除数和剩余最大 prompt length；剩余最大值必须 `<=8191`。不能再依赖
+   rank-local early return 绕过超长样本。
+3. 停止原样重试；保留已有 step 35/50 评测。从本实验自己的 Trainer
+   `checkpoint-60` 继续到 100，保留 Adam、RNG 和 hold scheduler。不要回到
+   `#10 checkpoint-30`，不要从评测快照 `output/distill/.../checkpoint-60`
+   热启动。
+4. 过滤会使 step 60 之后的数据流相对原 run 少掉超长样本；在最终状态中记录
+   `filtered_count`。这比改 seed / `dataset_start_index` 更可解释。
+5. 恢复后先确认越过 step 63，且 step 65/75/100 的 LR 都约为 `2e-6`；随后补评
+   75/100 并执行 timeline merge。若仍在 step 63 卡住，停止重试并收集各 rank
+   在 generate/backward 前后的日志。
+
+续训命令（代码含上述全局预过滤后执行）：
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+TAG10=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+TAG15=${TAG10}-from30hold
+test -d log/distill/${TAG15}/checkpoint-60
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 100 --save-steps 5 \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --resume-from log/distill/${TAG15}/checkpoint-60 \
+  --run-suffix from30hold
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir ./output/distill/${TAG15} \
+  --wbits 2 --eval-gpu 0 \
+  --steps 75,100 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics log/distill/${TAG15}/opd_step_metrics.jsonl \
+  --eval-root output/eval/${TAG15} \
+  --out-dir output/plots/${TAG15}
+```
 
 ```bash
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
