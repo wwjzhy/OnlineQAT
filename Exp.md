@@ -1006,13 +1006,72 @@ output/plots/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
 
 ---
 
-## Exp #16（2026-09-11 新增）— BF16 Qwen3-1.7B **thinking on** 的 GSM8K 上界
+## Exp #16（2026-09-13 新增）— W2 ReasoningQAT 最终权重再训练 **128 steps**
+
+**要求：** 从 `#11` 的最终 W2 ReasoningQAT 权重热启动，额外训练 128 个 optimizer steps，判断离线 ReasoningQAT 是否仍有增益。loss 保持 `0.2 * teacher-weighted CE + 1.0 * forward_kl`、`top_k=20`；尾段用 `lr=1e-6`、无 warmup、cosine 衰减到 0。每 32 step 保存一次，所有 checkpoint 和最终模型**只评 GSM8K 与 MATH-500**。不要覆盖 `#11`。
+
+这不是严格的 Trainer resume：`#11` 默认只保存最终量化权重，没有 Adam/scheduler checkpoint。因此本实验会保留模型权重，但重置 Adam 和学习率调度器；这里的 `max_steps=128` 表示**额外**训练 128 steps。
+
+**依赖：** `output/distill/Qwen3-1.7B-w2g128-reasoningqat/config.json`。
+
+**状态：** 未跑。在 8 卡机上跑。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+BASE=Qwen3-1.7B-w2g128-reasoningqat
+TAG=${BASE}-cont128
+test -f output/distill/${BASE}/config.json
+
+mkdir -p output/distill/${TAG} log/distill/${TAG}
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
+  --config_file configs/accelerate_config_multigpu.yaml \
+  --num_processes 8 --gpu_ids all \
+  main_e2e_distill.py \
+  --model output/distill/${BASE} \
+  --teacher_model "${MODEL_PATH}" \
+  --wbits 2 --group_size 128 \
+  --epochs 3 --max_steps 128 \
+  --learning_rate 1e-6 --lr_scheduler_type cosine --warmup_steps 0 \
+  --gkd_beta 1.0 --kl_weight 1.0 --cross_entropy_weight 0.2 \
+  --use_teacher_weight --kd_loss_type forward_kl --top_k 20 \
+  --dataset_type openthoughts --dataset_size 32768 --max_length 8192 \
+  --per_device_train_batch_size 1 --gradient_accumulation_steps 8 \
+  --save_steps 32 --save_total_limit 4 \
+  --save_quant_dir output/distill/${TAG} \
+  --output_dir log/distill/${TAG}
+
+touch output/distill/${TAG}/.train_done
+
+# 评 32/64/96/128 step 和最终权重；只跑 GSM8K、MATH-500，保留快照。
+KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir output/distill/${TAG} \
+  --wbits 2 --eval-gpu 0 \
+  --steps 32,64,96,128
+```
+
+开跑前应确认：`model=...-reasoningqat`、`max_steps=128`、`save_steps=32`、`learning_rate=1e-6`、`warmup_steps=0`。主要比较 `#11` final 与本实验 step 32/64/96/128 的 GSM8K、MATH-500；若提升只在中间出现，以最佳 checkpoint 为准，不要只报 final。
+
+产出：
+
+```
+output/distill/Qwen3-1.7B-w2g128-reasoningqat-cont128
+log/distill/Qwen3-1.7B-w2g128-reasoningqat-cont128
+output/eval/Qwen3-1.7B-w2g128-reasoningqat-cont128
+```
+
+---
+
+## Exp #17（2026-09-11 新增）— BF16 Qwen3-1.7B **thinking on** 的 GSM8K 上界
 
 **要求：** 评 **未量化、未训练** 的 BF16 `Qwen3-1.7B` 原模，**必须开 thinking**。用来当 `#10` / `#15` 以及后续量化实验的 teacher 上界。不要训练，不要 Stage 1/2，不要 convert，不要 `--train-emb`。只跑评测。本实验覆盖公共约定里「评的是量化产出」：这里评的是 `$MODEL_PATH` 原权重。
 
 协议与公共约定相同：`eval_paper_benchmarks.sh` + vLLM + evalscope，`T=0.6`，`top_k=20`，`max_tokens=8192`。**必须** `ENABLE_THINKING=1`。**不要**用 `scripts/eval_gsm8k_aime120.py`（那条是 thinking off + greedy + 2048）。
 
-| | OPT-QAT S0（已有，**不是本实验**） | **本实验 `#16`** |
+| | OPT-QAT S0（已有，**不是本实验**） | **本实验 `#17`** |
 |--|--|--|
 | 模型 | 同一份 BF16 `Qwen3-1.7B` | **相同** |
 | thinking | **关** | **开** |

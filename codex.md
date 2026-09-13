@@ -98,7 +98,8 @@
 | #13 | W2-OPD 100 vs W3-OPD 50 诊断 | W2 有 JSONL；W3 无 |
 | #14 | Qwen3-4B 复现离线六档 | 未跑；不要先做 4B-OPD |
 | #15 | 从 #10 的 **ckpt-30** hold `2e-6` 跑到 100 | **未跑**；不要从 step 100 续 |
-| #16 | BF16 1.7B **thinking on** GSM 上界 | **未跑** |
+| #16 | W2 ReasoningQAT 最终权重再训 128 step | **未跑**；权重热启，Adam/scheduler 重置 |
+| #17 | BF16 1.7B **thinking on** GSM 上界 | **未跑** |
 
 脚本默认 8 卡 Stage 2。这台 4 卡机（`ajv59d3mbdufs-0`）经常被占满，**不要抢卡**。真训在另一台 8 卡 H20。
 
@@ -194,7 +195,7 @@ Stage 1 校准 scale/clip 并把权重重建进网格。OPD 需要学生还能 r
 
 | | W3 | W2 |
 |--|--|--|
-| BF16 thinking（#16，最好不只有 GSM） | 上界 | 上界 |
+| BF16 thinking（#17，最好不只有 GSM） | 上界 | 上界 |
 | Stage 1 | 能评 | 能评（#10 起点 ~24.6 GSM） | 
 | 论文 offline QAT（#9 / #11） | 必须 | 必须 |
 | OPD **真正 hold**（#15 + 对齐的 W3-OPD） | 必须 | 必须 |
@@ -210,10 +211,11 @@ Stage 1 校准 scale/clip 并把权重重建进网格。OPD 需要学生还能 r
 ## 10. 建议执行顺序（不要并行发明方法）
 
 1. **#15**：8 卡，从 #10 `checkpoint-30` hold `2e-6` 到 100。看 35/50/75/100 的 GSM、jump、五任务。`hold_after_warmup=True`，LR 必须钉住。
-2. **#16**：1 空闲卡，BF16 thinking GSM（有余力加 MATH-500）。
+2. **#17**：1 空闲卡，BF16 thinking GSM（有余力加 MATH-500）。
 3. **#9 / #11**：论文离线主表。没有它们不要宣称方法赢了。
-4. 按 #15 结果再改**一处**方法：jump 不稳 → 冻 scale；主表不动 → 加 0.2 teacher-weighted CE 或偏 MATH 的 rollout；GSM 继续涨 → 加长 hold 或补全套评测。
-5. #14（4B 离线）和「无 Stage 1」探针可以后做，不挡主表。
+4. **#16**：从 #11 最终权重热启动，再训 128 step，看 32/64/96/128 的增益曲线。
+5. 按 #15 结果再改**一处**方法：jump 不稳 → 冻 scale；主表不动 → 加 0.2 teacher-weighted CE 或偏 MATH 的 rollout；GSM 继续涨 → 加长 hold 或补全套评测。
+6. #14（4B 离线）和「无 Stage 1」探针可以后做，不挡主表。
 
 不要：再扫 LR；从 #10 step 100 续训；先上 PV-OPD / 4B-OPD；把 reverse KL 改成 forward KL 同时改占用（confound）；只报 GSM 结案。
 
