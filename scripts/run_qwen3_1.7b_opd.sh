@@ -36,6 +36,16 @@ RESUME=0
 RESUME_FROM=""
 INIT_FROM=""
 RUN_SUFFIX=""
+MIXED_OPD=0
+ONLINE_RATIO="0.25"
+GATE_SOFT="0.05"
+GATE_HARD="0.08"
+GATE_RATIO_STEP="0.25"
+GATE_INTERVAL="5"
+GATE_PATIENCE="2"
+GATE_START_STEP="30"
+GATE_EMA_BETA="0.9"
+TOP_K="20"
 
 MODEL="${MODEL_PATH:-/zju_0038/zq/models/Qwen3-1.7B}"
 TEACHER="${TEACHER_MODEL:-${MODEL}}"
@@ -82,6 +92,16 @@ Options:
   --resume-from PATH     Resume from an explicit Trainer checkpoint directory
   --init-from PATH       Weight-only warm-start (eval snapshot / distill dir); not true resume
   --run-suffix STR       Append -<STR> to distill tag (e.g. cont50) to avoid overwriting
+  --mixed-opd            Offline top-k FKL + online sampled RKL, code-jump gated
+  --online-ratio R       Initial/fixed online-step ratio (default: 0.25)
+  --gate-soft R          Raise online ratio below this jump EMA (default: 0.05)
+  --gate-hard R          Lower online ratio at/above this jump EMA (default: 0.08)
+  --gate-ratio-step R    Ratio change per decision (default: 0.25)
+  --gate-interval N      Decision interval; 0 disables gate (default: 5)
+  --gate-patience N      Stable decisions before raising ratio (default: 2)
+  --gate-start-step N    First gate decision step (default: 30)
+  --gate-ema-beta R      Code-jump EMA beta (default: 0.9)
+  --top-k N              Teacher top-k for offline FKL (default: 20)
   --eval-gpu ID          GPU for convert+evalscope watcher (requires --save-steps > 0)
   -h, --help             Show this help
 
@@ -127,6 +147,16 @@ while [[ $# -gt 0 ]]; do
     --resume-from) RESUME_FROM="$2"; RESUME=1; shift 2 ;;
     --init-from) INIT_FROM="$2"; shift 2 ;;
     --run-suffix) RUN_SUFFIX="$2"; shift 2 ;;
+    --mixed-opd) MIXED_OPD=1; shift ;;
+    --online-ratio) ONLINE_RATIO="$2"; shift 2 ;;
+    --gate-soft) GATE_SOFT="$2"; shift 2 ;;
+    --gate-hard) GATE_HARD="$2"; shift 2 ;;
+    --gate-ratio-step) GATE_RATIO_STEP="$2"; shift 2 ;;
+    --gate-interval) GATE_INTERVAL="$2"; shift 2 ;;
+    --gate-patience) GATE_PATIENCE="$2"; shift 2 ;;
+    --gate-start-step) GATE_START_STEP="$2"; shift 2 ;;
+    --gate-ema-beta) GATE_EMA_BETA="$2"; shift 2 ;;
+    --top-k) TOP_K="$2"; shift 2 ;;
     --eval-gpu) EVAL_GPU="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -164,6 +194,9 @@ fi
 
 EXP_NAME="Qwen3-1.7B-w${WBITS}g${GROUP_SIZE}"
 DISTILL_TAG="${EXP_NAME}-opd"
+if [[ "${MIXED_OPD}" -eq 1 ]]; then
+  DISTILL_TAG="${EXP_NAME}-mixedopd"
+fi
 if [[ "${TRAIN_EMB}" -eq 1 ]]; then
   DISTILL_TAG="${EXP_NAME}-trainemb-opd"
 fi
@@ -289,6 +322,23 @@ elif [[ "${RESUME}" -eq 1 ]]; then
   RESUME_FLAGS+=(--resume)
 fi
 
+OPD_FLAGS=(--opd)
+if [[ "${MIXED_OPD}" -eq 1 ]]; then
+  OPD_FLAGS=(
+    --mixed_opd
+    --kd_loss_type forward_kl
+    --top_k "${TOP_K}"
+    --online_ratio "${ONLINE_RATIO}"
+    --gate_soft_threshold "${GATE_SOFT}"
+    --gate_hard_threshold "${GATE_HARD}"
+    --gate_ratio_step "${GATE_RATIO_STEP}"
+    --gate_interval "${GATE_INTERVAL}"
+    --gate_patience "${GATE_PATIENCE}"
+    --gate_start_step "${GATE_START_STEP}"
+    --gate_ema_beta "${GATE_EMA_BETA}"
+  )
+fi
+
 if [[ -n "${EVAL_GPU}" ]]; then
   case ",${DISTILL_GPUS}," in
     *",${EVAL_GPU},"*)
@@ -309,7 +359,10 @@ echo "  model=${MODEL}"
 echo "  teacher=${TEACHER}"
 echo "  python=${PY}"
 echo "Stage 2 GPUs: ${DISTILL_GPUS}  (${N_DISTILL_GPUS} GPU, accum=${GRAD_ACCUM}, effective_batch=${EFFECTIVE_BATCH}, max_length=${MAX_LENGTH})"
-echo "  student generate then sampled reverse-KL policy gradient; no CE"
+echo "  mode=$([[ "${MIXED_OPD}" -eq 1 ]] && echo mixed-opd || echo opd)  no CE"
+if [[ "${MIXED_OPD}" -eq 1 ]]; then
+  echo "  offline=top${TOP_K}-FKL online=sampled-RKL ratio=${ONLINE_RATIO} gate=${GATE_SOFT}/${GATE_HARD} interval=${GATE_INTERVAL} start=${GATE_START_STEP}"
+fi
 echo "  lr=${DISTILL_LR} (default ${DEFAULT_DISTILL_LR})  warmup_steps=${WARMUP_STEPS:-ratio0.2}  warmup_start_lr=${WARMUP_START_LR:-0}"
 echo "  lr_scheduler=${LR_SCHEDULER:-linear}  save_steps=${SAVE_STEPS}  max_steps=${MAX_STEPS:-epochs}  eval_gpu=${EVAL_GPU:-none}"
 echo "  resume=${RESUME}  resume_from=${RESUME_FROM:-auto}  init_from=${INIT_FROM:-none}  run_suffix=${RUN_SUFFIX:-none}"
@@ -370,7 +423,7 @@ if run_stage 2; then
       --learning_rate "${DISTILL_LR}" \
       --kl_weight 1.0 \
       --cross_entropy_weight 0.0 \
-      --opd \
+      "${OPD_FLAGS[@]}" \
       --dataset_type "${DATASET_TYPE}" \
       --dataset_size "${DATASET_SIZE}" \
       --max_length "${MAX_LENGTH}" \

@@ -1179,6 +1179,355 @@ output/eval/Qwen3-1.7B-bf16-thinking
 
 ---
 
+## Exp #18（2026-09-14 新增）— W2 Stability-Gated Mixed OPD 试跑
+
+**目标：** 从 `#4` 的 W2 Stage1 权重出发，用一组最小的
+固定混合对照检验「offline trajectory anchor + code-jump gate」是否值得继续。
+这是 screening，不作为最终论文结果；只有通过下面 go/no-go 条件才扩到 100
+step 和多 seed。
+
+两条分支除 occupancy 调度外完全一致：OpenThoughts 32768、effective batch 64、
+`max_length=8192`、CE=0、peak LR `2e-6`、前 30 step 从 `2e-7` warmup，之后
+hold。offline step 在 gold/teacher trajectory 上算 teacher top-20 forward KL；
+online step 使用 student rollout + 当前 sampled reverse-KL。不要 `--train-emb`。
+
+| 分支 | 初始 online ratio | gate | 回答的问题 |
+|---|---:|---|---|
+| A fixed-50 | 0.50 | 关闭（`interval=0`） | 混合 occupancy 本身是否有效 |
+| B gated | 0.25 | EMA；soft=5%，hard=8% | 动态门控是否优于固定混合 |
+
+B 每 5 optimizer step 决策一次，step 30 前只记录、不改变比例；连续两个决策
+窗口的 jump EMA `<5%` 后把 online ratio 加 0.25；raw jump 或 jump EMA
+`>=8%` 时立即减 0.25，比例下限 0.25、上限 1.0。门控只改 occupancy，
+**不同时改 LR**。
+同一 optimizer step 的所有 gradient-accumulation microbatch 使用同一种
+occupancy；rank 0 计算 jump 后把下一步 ratio 同步给全部 DDP rank。
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`（`#4` Stage1）。
+两条分支都从同一份 Stage1 权重启动；不要使用 `--init-from` 或 `--resume`。
+启动前代码单测和 shell 检查必须通过。
+
+**状态：** 未跑。按两阶段顺序筛选，先只跑 B 到 40 step；B 没信号就停止，
+不要支付 A 的训练成本。B 通过 screening 后才跑 A。不要并行争抢资源。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+STAGE1=output/block_qat/Qwen3-1.7B-w2g128
+test -f "${STAGE1}/config.json"
+
+python tests/test_opd_stage2.py
+bash -n scripts/run_qwen3_1.7b_opd.sh
+
+# Phase 1 / B：先只跑 5%/8% code-jump EMA 门控筛选。
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --mixed-opd --online-ratio 0.25 \
+  --gate-soft 0.05 --gate-hard 0.08 --gate-ratio-step 0.25 \
+  --gate-interval 5 --gate-patience 2 --gate-start-step 30 \
+  --gate-ema-beta 0.9 \
+  --max-steps 40 --save-steps 20 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --top-k 20 --run-suffix stage1-gated-screen40
+
+# Phase 2 / A：只有 B 通过 screening 才运行这个固定 50% 对照。
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --mixed-opd --online-ratio 0.50 --gate-interval 0 \
+  --max-steps 40 --save-steps 20 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --top-k 20 --run-suffix stage1-fixed50-screen40
+```
+
+训练启动后先检查横幅和日志：
+
+1. 两条分支都必须显示 `student=.../block_qat/Qwen3-1.7B-w2g128`、CE=0、offline=top20-FKL、
+   online=sampled-RKL、hold=True。
+2. prompt filter 必须打印 before/after/filtered/max；`max_after<=8191`，否则停。
+3. A 的 `opd/online_ratio` 始终为 0.50；B 在 step 30 前始终为 0.25。
+4. JSONL 必须含 `opd/online_batch`、`opd/online_ratio`、
+   `opd/code_jump_ema`、`opd/gate_action`，且所有 rank 不得走不同 occupancy。
+
+Phase 1 只评 B 的 step 40，并补齐 Vanilla step 40；不要先评中间点：
+
+```bash
+FIXED=Qwen3-1.7B-w2g128-mixedopd-lr2e-6-wu30-ws2e-7-schhold-stage1-fixed50-screen40
+GATED=Qwen3-1.7B-w2g128-mixedopd-lr2e-6-wu30-ws2e-7-schhold-stage1-gated-screen40
+VANILLA=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+
+# #15 checkpoint-40 是相同 Stage1/LR schedule 的 online-only 对照。
+KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${VANILLA}" \
+  --wbits 2 --eval-gpu 0 --steps 40 --skip-final
+
+KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${GATED}" \
+  --wbits 2 --eval-gpu 0 --steps 40 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${GATED}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${GATED}" \
+  --out-dir "output/plots/${GATED}"
+
+# B 通过下面 screening 后，再用同一命令评 FIXED 的 step 40。
+```
+
+**Phase 1 go/no-go：** B 在 step 40 前必须至少改变一次 ratio、jump P95 `<8%`、
+peak `<10%`、无 NaN/分数崩塌；并且相对同 step Vanilla 满足：两任务均值不差
+超过 0.5 pt，或 jump P95 至少降低 20%。不满足就停止，不跑 A。
+
+**Phase 2 go/no-go：** B 通过后才跑 A。相对 A，B 的两任务均值高 1.0 pt，
+或者 jump P95 降低 20% 且均值不差超过 0.5 pt，才把 gate 视为有效。另报累计
+online steps 和 rollout wall time，并按相同累计 online steps 对齐比较。刚过线的
+checkpoint 重复评一次，避免把约 1 pt 的采样噪声当成提升。
+
+- B 通过两阶段筛选：重新从 Stage1 跑正式 60/100 step，再补 3 seeds；随后做 W3。
+- A、B 都提升但相近：保留更简单的 fixed mixture，动态 gate 暂不作为贡献。
+- A 提升、B 变差：阈值/滞后有问题，只扫 `4/6`、`5/8`、`6/10` 三档。
+- A、B 都不提升：停止调 gate，先做 loss-matched Offline-FKL vs Online-FKL，
+  判断瓶颈是 occupancy 还是 sampled-RKL objective。
+
+产出：
+
+```
+output/distill/<FIXED|GATED>
+output/eval/<FIXED|GATED>
+log/distill/<FIXED|GATED>/opd_step_metrics.jsonl
+log/distill/<FIXED|GATED>/opd_timing_summary.json
+output/plots/<FIXED|GATED>/opd_timeline.csv
+```
+
+---
+
+## Exp #19（2026-09-14 新增）— 对比 W2-OPD 的 decay70 与 stable55 训练统计
+
+**目标：** 不重训，只汇总已有的两条 W2-OPD 轨迹，判断 stable 相比 decay
+是否真的降低了梯度/跳码波动，并对应到 GSM8K、MATH-500。主比较使用共同终点
+step 85；不能拿 stable 的 step 85 直接和 decay 的 step 100 下结论。
+
+| 简称 | 数据组成 | 实际 schedule |
+|---|---|---|
+| decay70 | `#10` step 1–100 | warmup 1–30 + decay 31–100 |
+| stable55 | `#10` step 1–30 + `#15` step 31–85 | 同一 warmup + hold `2e-6` 55 step |
+
+`#15` 若已经跑过 step 85，统计时仍截断到 85。JSONL 中 resume/retry 造成的重复
+step 按字段保留最后一次记录；最终 `train_runtime` 等稀疏日志不能覆盖该 step 已有
+训练指标。
+
+**统计口径：**
+
+- 完整 schedule：decay70 统计 step 1–100；stable55 统计拼接后的 step 1–85。
+- tail 主分析：decay70 统计 step 31–100；stable55 统计 step 31–85。
+- LR、loss、response length、EOS、truncation 报 step 宏平均；grad norm、code
+  jump、code-jump amplification 报均值 / P95 / 最大值。P95 用线性插值。
+- `code_jump_rate`、`eos_rate`、`truncation_rate` 以百分数报告；amplification
+  为无量纲比值。每项同时打印有效 step 数，数量不足时不填结果。
+- 评测协议沿用原实验：thinking on、`T=0.6`、`top_k=20`、
+  `max_tokens=8192`。共同 checkpoint 报 35/50/75/85；另报共享起点 30 和
+  decay 最终点 100。
+
+**依赖：** `#10` 的完整 JSONL / checkpoints，以及 `#15` 至少训练并保存到
+step 85。没有 step 85 就先补完 `#15`，不要用插值后的 benchmark 分数。
+
+**状态：** 待统计。只做日志聚合和缺失 checkpoint 评测，不启动 Stage 2。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+DECAY=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold
+STABLE=${DECAY}-from30hold
+
+test -f "log/distill/${DECAY}/opd_step_metrics.jsonl"
+test -f "log/distill/${STABLE}/opd_step_metrics.jsonl"
+test -d "output/distill/${DECAY}/checkpoint-85"
+test -d "output/distill/${STABLE}/checkpoint-85"
+
+# 补齐同 step 评测；已有结果会复用。step 30 是两条分支的共享起点。
+KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${DECAY}" --wbits 2 --eval-gpu 0 \
+  --steps 30,35,50,75,85,100 --skip-final
+
+KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${STABLE}" --wbits 2 --eval-gpu 0 \
+  --steps 35,50,75,85 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${DECAY}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${DECAY}" \
+  --out-dir "output/plots/${DECAY}"
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${STABLE}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${STABLE}" \
+  --out-dir "output/plots/${STABLE}"
+
+# 打印完整 schedule 和 tail 两张 Markdown 表；只使用 Python 标准库。
+python - <<'PY'
+import json
+import math
+from pathlib import Path
+from quantize.opd_metrics import load_eval_scores_for_step
+
+decay = "Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold"
+stable = decay + "-from30hold"
+
+keys = {
+    "lr": "learning_rate",
+    "loss": "loss",
+    "grad": "grad_norm",
+    "jump": "opd/code_jump_rate",
+    "amp": "opd/code_jump_amplification",
+    "response": "opd/mean_response_len",
+    "eos": "opd/eos_rate",
+    "trunc": "opd/truncation_rate",
+}
+
+def load(tag):
+    # Later records overwrite only fields they actually contain. This keeps the
+    # last retry while preventing a final sparse train summary from erasing data.
+    rows = {}
+    path = Path("log/distill") / tag / "opd_step_metrics.jsonl"
+    for line in path.read_text().splitlines():
+        row = json.loads(line)
+        if "step" in row:
+            rows.setdefault(int(row["step"]), {}).update(row)
+    return rows
+
+def pct95(values):
+    values = sorted(values)
+    if len(values) == 1:
+        return values[0]
+    pos = 0.95 * (len(values) - 1)
+    lo, hi = math.floor(pos), math.ceil(pos)
+    return values[lo] + (values[hi] - values[lo]) * (pos - lo)
+
+def values(rows, key, lo, hi):
+    return [float(rows[s][key]) for s in range(lo, hi + 1)
+            if s in rows and key in rows[s]]
+
+def fmt(x, percent=False):
+    return f"{100*x:.4f}%" if percent else f"{x:.6g}"
+
+def report(name, rows, lo, hi):
+    xs = {name: values(rows, key, lo, hi) for name, key in keys.items()}
+    required = hi - lo + 1
+    counts = ", ".join(f"{k}={len(v)}/{required}" for k, v in xs.items())
+    if any(len(v) != required for v in xs.values()):
+        raise SystemExit(f"{name} step {lo}-{hi}: missing metrics: {counts}")
+    mean = lambda v: sum(v) / len(v)
+    return {
+        "run": name, "steps": f"{lo}-{hi}", "n": required,
+        "lr_mean": fmt(mean(xs["lr"])), "loss_mean": fmt(mean(xs["loss"])),
+        "grad_mean": fmt(mean(xs["grad"])),
+        "grad_p95": fmt(pct95(xs["grad"])), "grad_max": fmt(max(xs["grad"])),
+        "jump_mean": fmt(mean(xs["jump"]), True),
+        "jump_p95": fmt(pct95(xs["jump"]), True),
+        "jump_max": fmt(max(xs["jump"]), True),
+        "amp_mean": fmt(mean(xs["amp"])),
+        "amp_p95": fmt(pct95(xs["amp"])), "amp_max": fmt(max(xs["amp"])),
+        "response_mean": fmt(mean(xs["response"])),
+        "eos_mean": fmt(mean(xs["eos"]), True),
+        "trunc_mean": fmt(mean(xs["trunc"]), True),
+    }
+
+d, s = load(decay), load(stable)
+stable_full = {k: v for k, v in d.items() if 1 <= k <= 30}
+stable_full.update({k: v for k, v in s.items() if 31 <= k <= 85})
+
+rows = []
+for scope, reports in [
+    ("完整 schedule", [report("decay70", d, 1, 100),
+                       report("stable55", stable_full, 1, 85)]),
+    ("tail（主分析）", [report("decay70", d, 31, 100),
+                       report("stable55", s, 31, 85)]),
+]:
+    rows.extend({"scope": scope, **row} for row in reports)
+
+def table(title, columns):
+    print(f"\n### {title}\n")
+    print("| " + " | ".join(label for _, label in columns) + " |")
+    print("|" + "---|" * len(columns))
+    for row in rows:
+        print("| " + " | ".join(str(row[key]) for key, _ in columns) + " |")
+
+base = [("scope", "统计区间"), ("run", "run"), ("steps", "steps"), ("n", "n")]
+table("表 1：优化状态", base + [
+    ("lr_mean", "LR mean"), ("loss_mean", "loss mean"),
+    ("grad_mean", "grad mean"), ("grad_p95", "grad P95"),
+    ("grad_max", "grad max"),
+])
+table("表 2：量化稳定性", base + [
+    ("jump_mean", "jump mean"), ("jump_p95", "jump P95"),
+    ("jump_max", "jump max"), ("amp_mean", "amp mean"),
+    ("amp_p95", "amp P95"), ("amp_max", "amp max"),
+])
+table("表 3：Rollout 状态", base + [
+    ("response_mean", "response length mean"),
+    ("eos_mean", "EOS mean"), ("trunc_mean", "truncation mean"),
+])
+
+def eval_score(tag, step, dataset):
+    scores = load_eval_scores_for_step(Path("output/eval") / tag, step)
+    candidates = [(k, v) for k, v in scores.items()
+                  if dataset in k.lower()]
+    if not candidates:
+        return "—"
+    # Prefer the shortest dataset-specific accuracy/score key over nested copies.
+    candidates.sort(key=lambda kv: (
+        not kv[0].lower().endswith(("accuracy", "score", "exact_match")),
+        len(kv[0]),
+    ))
+    value = float(candidates[0][1])
+    value = 100 * value if abs(value) <= 1 else value
+    return f"{value:.2f}"
+
+print("\n### 表 4：GSM8K / MATH-500 checkpoints\n")
+print("| step | decay GSM8K | decay MATH-500 | stable GSM8K | stable MATH-500 |")
+print("|---:|---:|---:|---:|---:|")
+for step in (30, 35, 50, 75, 85, 100):
+    stable_tag = decay if step == 30 else stable
+    stable_scores = ([eval_score(stable_tag, step, ds)
+                      for ds in ("gsm8k", "math_500")]
+                     if step <= 85 else ["—", "—"])
+    row = [step, eval_score(decay, step, "gsm8k"),
+           eval_score(decay, step, "math_500"), *stable_scores]
+    print("| " + " | ".join(map(str, row)) + " |")
+PY
+```
+
+把脚本输出的四张表填回本节。表 1 回答优化是否稳定，表 2 回答极低 bit
+跳码是否受控，表 3 检查 rollout 分布是否改变，表 4 对应最终任务效果：
+
+| step | decay70 GSM8K | decay70 MATH-500 | stable55 GSM8K | stable55 MATH-500 |
+|---:|---:|---:|---:|---:|
+| 30（共享起点） | 待填 | 待填 | 同左 | 同左 |
+| 35 | 待填 | 待填 | 待填 | 待填 |
+| 50 | 待填 | 待填 | 待填 | 待填 |
+| 75 | 待填 | 待填 | 待填 | 待填 |
+| **85（主比较）** | **待填** | **待填** | **待填** | **待填** |
+| 100（仅 decay） | 待填 | 待填 | — | — |
+
+**结论门槛：** 只有 stable 在共同 step 85 的 GSM8K/MATH-500 不差、且 tail
+的 grad norm 或 code jump 的 P95/最大值明显更低，才支持“stable 提高训练稳定性”。
+若仅 LR/loss 更平滑而 benchmark 不升，只能说优化轨迹更平滑，不能说效果更好。
+
+产出：
+
+```
+output/plots/${DECAY}/opd_timeline.{csv,jsonl}
+output/plots/${STABLE}/opd_timeline.{csv,jsonl}
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：

@@ -80,6 +80,8 @@ def _bare_trainer(**kwargs):
     obj.beta = kwargs.get("beta", 1.0)
     obj.temperature = kwargs.get("temperature", 1.0)
     obj.opd_mode = kwargs.get("opd_mode", True)
+    obj.mixed_opd_mode = kwargs.get("mixed_opd_mode", False)
+    obj._current_batch_on_policy = kwargs.get("current_batch_on_policy", True)
     obj.pv_opd_mode = False
     obj.teacher_model = kwargs["teacher_model"]
     return obj
@@ -198,6 +200,63 @@ def test_compute_loss_ce0_has_no_ce_graph():
     assert float(loss.detach()) >= 0
 
 
+def test_mixed_opd_offline_step_uses_forward_kl():
+    torch.manual_seed(7)
+    student = TinyLM()
+    teacher = TinyLM()
+    obj = _bare_trainer(
+        teacher_model=teacher,
+        mixed_opd_mode=True,
+        current_batch_on_policy=False,
+        kd_loss_type="forward_kl",
+        top_k=8,
+    )
+    input_ids = torch.randint(2, 20, (1, 7))
+    labels = input_ids.clone()
+    labels[:, :3] = -100
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": labels,
+        "prompts": input_ids[:, :3],
+    }
+    got = PolicyGKDTrainer.compute_loss(obj, student, inputs)
+    with torch.no_grad():
+        student_logits = student(input_ids).logits[:, :-1]
+        teacher_logits = teacher(input_ids).logits[:, :-1]
+        expected = PolicyGKDTrainer.forward_kl_loss(
+            student_logits,
+            teacher_logits,
+            labels=labels[:, 1:],
+            top_k=8,
+        )
+    assert torch.allclose(got.detach(), expected, atol=1e-5), (got, expected)
+
+
+def test_mixed_opd_gate_schedule():
+    trainer = PolicyGKDTrainer.__new__(PolicyGKDTrainer)
+    trainer.opd_mode = True
+    trainer.mixed_opd_mode = True
+    trainer.online_ratio = 0.25
+    trainer.gate_soft_threshold = 0.05
+    trainer.gate_hard_threshold = 0.08
+    trainer.gate_ratio_step = 0.25
+    trainer.gate_interval = 5
+    trainer.gate_patience = 2
+    trainer.gate_start_step = 0
+    trainer.gate_ema_beta = 0.0
+    trainer._gate_jump_ema = None
+    trainer._gate_stable_windows = 0
+
+    assert sum(trainer.use_on_policy_batch(step) for step in range(4)) == 1
+    trainer.update_occupancy_gate(0.02, 5)
+    out = trainer.update_occupancy_gate(0.02, 10)
+    assert out["online_ratio"] == 0.5
+    assert sum(trainer.use_on_policy_batch(step) for step in range(4)) == 2
+    out = trainer.update_occupancy_gate(0.09, 12)
+    assert out["online_ratio"] == 0.25
+
+
 def test_opd_replaces_batch_with_student_rollout_and_masks_prompt():
     torch.manual_seed(3)
     model = TinyLM()
@@ -261,9 +320,10 @@ def test_scripts_gkd_vs_opd_flags():
     assert "--opd" not in gkd
     assert "--cross_entropy_weight 0.2" in gkd
     assert "--kd_loss_type jsd" in gkd
-    assert "--opd \\" in opd or "--opd\n" in opd
     assert "--cross_entropy_weight 0.0" in opd
-    assert "--top_k" not in opd
+    assert "OPD_FLAGS=(--opd)" in opd
+    assert "--mixed_opd" in opd
+    assert '--top_k "${TOP_K}"' in opd
     assert "sampled reverse KL" in opd
     assert "block_qat" in opd
     assert "-opd" in opd
@@ -431,6 +491,8 @@ if __name__ == "__main__":
         test_sampled_reverse_kl_identical_policies_has_zero_gradient,
         test_compute_loss_ce0_ignores_gold_labels,
         test_compute_loss_ce0_has_no_ce_graph,
+        test_mixed_opd_offline_step_uses_forward_kl,
+        test_mixed_opd_gate_schedule,
         test_opd_replaces_batch_with_student_rollout_and_masks_prompt,
         test_generation_budget_is_total_max_length_not_extra_new_tokens,
         test_opd_masks_keep_first_eos_and_drop_later_padding,

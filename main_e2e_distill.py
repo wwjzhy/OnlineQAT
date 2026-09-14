@@ -202,6 +202,15 @@ class PolicyGKDTrainer(GKDTrainer):
         mean_prob=0,
         beta=None,
         opd_mode=False,
+        mixed_opd_mode=False,
+        online_ratio=1.0,
+        gate_soft_threshold=0.05,
+        gate_hard_threshold=0.08,
+        gate_ratio_step=0.25,
+        gate_interval=5,
+        gate_patience=2,
+        gate_start_step=30,
+        gate_ema_beta=0.9,
         pv_opd_mode=False,
         pv_probe_bits=4,
         pv_gate_mode="full",
@@ -223,6 +232,18 @@ class PolicyGKDTrainer(GKDTrainer):
         if beta is not None:
             self.beta = beta
         self.opd_mode = opd_mode
+        self.mixed_opd_mode = mixed_opd_mode
+        self.online_ratio = float(online_ratio)
+        self.gate_soft_threshold = float(gate_soft_threshold)
+        self.gate_hard_threshold = float(gate_hard_threshold)
+        self.gate_ratio_step = float(gate_ratio_step)
+        self.gate_interval = int(gate_interval)
+        self.gate_patience = int(gate_patience)
+        self.gate_start_step = int(gate_start_step)
+        self.gate_ema_beta = float(gate_ema_beta)
+        self._gate_jump_ema = None
+        self._gate_stable_windows = 0
+        self._current_batch_on_policy = bool(opd_mode and not mixed_opd_mode)
         self.pv_opd_mode = pv_opd_mode
         self.pv_probe_bits = pv_probe_bits
         self.pv_gate_mode = pv_gate_mode
@@ -239,6 +260,58 @@ class PolicyGKDTrainer(GKDTrainer):
         self._pv_metrics_last_step = None
         # Keep teacher model on GPU - do not move to CPU to avoid memory leaks
         # Teacher model device should be managed by device_map during initialization
+
+    def use_on_policy_batch(self, step=None):
+        """Choose one occupancy for the whole optimizer step on every rank."""
+        if not self.opd_mode:
+            return False
+        if not self.mixed_opd_mode:
+            return True
+        step = int(self.state.global_step if step is None else step)
+        cycle = max(1, round(1.0 / max(self.gate_ratio_step, 1e-6)))
+        online_slots = min(cycle, max(0, round(self.online_ratio * cycle)))
+        # Coprime permutation spreads online steps through the cycle.
+        slot = (step * max(1, cycle - 1)) % cycle
+        return slot >= cycle - online_slots
+
+    def update_occupancy_gate(self, jump_rate, step):
+        """Update the next-step online ratio from a smoothed code-jump rate."""
+        jump_rate = float(jump_rate)
+        beta = self.gate_ema_beta
+        self._gate_jump_ema = (
+            jump_rate
+            if self._gate_jump_ema is None
+            else beta * self._gate_jump_ema + (1.0 - beta) * jump_rate
+        )
+        action = 0.0
+        if (
+            self.mixed_opd_mode
+            and self.gate_interval > 0
+            and int(step) >= self.gate_start_step
+        ):
+            if max(jump_rate, self._gate_jump_ema) >= self.gate_hard_threshold:
+                old = self.online_ratio
+                self.online_ratio = max(self.gate_ratio_step, old - self.gate_ratio_step)
+                action = self.online_ratio - old
+                self._gate_stable_windows = 0
+            elif (
+                int(step) % self.gate_interval == 0
+                and self._gate_jump_ema < self.gate_soft_threshold
+            ):
+                self._gate_stable_windows += 1
+                if self._gate_stable_windows >= self.gate_patience:
+                    old = self.online_ratio
+                    self.online_ratio = min(1.0, old + self.gate_ratio_step)
+                    action = self.online_ratio - old
+                    self._gate_stable_windows = 0
+            elif int(step) % self.gate_interval == 0:
+                self._gate_stable_windows = 0
+        return {
+            "code_jump_ema": float(self._gate_jump_ema),
+            "online_ratio": float(self.online_ratio),
+            "gate_action": float(action),
+            "gate_stable_windows": float(self._gate_stable_windows),
+        }
 
     @staticmethod
     def forward_kl_loss(student_logits, teacher_logits, labels=None, temperature=1.0, top_k=None):
@@ -509,8 +582,15 @@ class PolicyGKDTrainer(GKDTrainer):
         return attention_mask, labels
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """OPD: roll out the student before applying sampled reverse KL."""
-        if self.opd_mode:
+        """Use student rollouts on online steps and gold trajectories otherwise."""
+        self._current_batch_on_policy = self.use_on_policy_batch()
+        if self.mixed_opd_mode:
+            self._pending_opd_rollout_metrics = {
+                "online_batch": float(self._current_batch_on_policy),
+                "online_ratio": float(self.online_ratio),
+                "rollout_seconds": 0.0,
+            }
+        if self._current_batch_on_policy:
             prompts = inputs["prompts"]
             prompt_attention_mask = inputs.get(
                 "prompt_attention_mask",
@@ -533,6 +613,7 @@ class PolicyGKDTrainer(GKDTrainer):
                 )
                 loss = outputs.loss * 0.0
                 self._pending_opd_rollout_metrics = {
+                    **self._pending_opd_rollout_metrics,
                     "truncation_rate": 0.0,
                     "mean_response_len": 0.0,
                     "mean_seq_len": float(prompt_lens.float().mean().item()),
@@ -574,6 +655,7 @@ class PolicyGKDTrainer(GKDTrainer):
                 )
                 loss = outputs.loss * 0.0
                 self._pending_opd_rollout_metrics = {
+                    **self._pending_opd_rollout_metrics,
                     "truncation_rate": 0.0,
                     "mean_response_len": 0.0,
                     "mean_seq_len": float(max_prompt_len),
@@ -622,12 +704,21 @@ class PolicyGKDTrainer(GKDTrainer):
             )
             reduced["skipped_oversized_prompt"] = 0.0
             self._accum_opd_rollout_seconds = reduced["rollout_seconds"]
-            self._pending_opd_rollout_metrics = reduced
+            self._pending_opd_rollout_metrics = {
+                **self._pending_opd_rollout_metrics,
+                **reduced,
+            }
             inputs = dict(inputs)
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
             return super(GKDTrainer, self).training_step(model, inputs, num_items_in_batch)
+        if self.mixed_opd_mode:
+            # Keep the dataset completion untouched on offline steps; calling
+            # GKDTrainer.training_step would sample because args.lmbda=1.
+            return super(GKDTrainer, self).training_step(
+                model, inputs, num_items_in_batch
+            )
         return super().training_step(model, inputs, num_items_in_batch)
 
     def log(self, logs, start_time=None, **kwargs):
@@ -821,7 +912,11 @@ class PolicyGKDTrainer(GKDTrainer):
         # currently we only support next token prediction
         # OPD only gathers sampled-token log-probs, so views avoid duplicating
         # the large [batch, sequence, vocabulary] tensors.
-        make_contiguous = not self.opd_mode
+        on_policy_batch = self.opd_mode and (
+            not getattr(self, "mixed_opd_mode", False)
+            or getattr(self, "_current_batch_on_policy", True)
+        )
+        make_contiguous = not on_policy_batch
         shifted_student_logits = student_outputs.logits[:, :-1, :]
         shifted_teacher_logits = teacher_logits[:, :-1, :]
         if make_contiguous:
@@ -876,7 +971,7 @@ class PolicyGKDTrainer(GKDTrainer):
                     labels=shifted_labels,
                 )
                 del student_logp, teacher_logp, probe_logp
-            elif self.opd_mode:
+            elif on_policy_batch:
                 kl_loss = self.sampled_reverse_kl_policy_loss(
                     student_logits=shifted_student_logits,
                     teacher_logits=shifted_teacher_logits,
@@ -1048,24 +1143,44 @@ class OpdMetricsCallback(TrainerCallback):
             pending = dict(getattr(trainer, "_pending_opd_jump_metrics", {}) or {})
             pending["step_seconds"] = step_seconds
             trainer._pending_opd_jump_metrics = pending
-        if not state.is_world_process_zero or model is None or not self.track_code_jump:
+        if model is None or not self.track_code_jump:
             return
-        unwrapped = model.module if hasattr(model, "module") else model
-        new_codes = snapshot_quant_codes(unwrapped)
-        jump = code_jump_rate(self._prev_codes, new_codes)
-        rel, new_weights = master_rel_change(self._prev_weights, unwrapped)
-        jump["master_rel_change"] = rel
-        if jump.get("code_jump_rate", 0.0) > 0 and rel > 0:
-            jump["code_jump_amplification"] = float(
-                jump["code_jump_rate"] / max(rel, 1e-12)
-            )
-        else:
-            jump["code_jump_amplification"] = 0.0
-        jump["step_seconds"] = step_seconds
-        if trainer is not None:
-            trainer._pending_opd_jump_metrics = jump
-        self._prev_codes = new_codes
-        self._prev_weights = new_weights
+        if state.is_world_process_zero:
+            unwrapped = model.module if hasattr(model, "module") else model
+            new_codes = snapshot_quant_codes(unwrapped)
+            jump = code_jump_rate(self._prev_codes, new_codes)
+            rel, new_weights = master_rel_change(self._prev_weights, unwrapped)
+            jump["master_rel_change"] = rel
+            if jump.get("code_jump_rate", 0.0) > 0 and rel > 0:
+                jump["code_jump_amplification"] = float(
+                    jump["code_jump_rate"] / max(rel, 1e-12)
+                )
+            else:
+                jump["code_jump_amplification"] = 0.0
+            jump["step_seconds"] = step_seconds
+            if trainer is not None and getattr(trainer, "mixed_opd_mode", False):
+                jump.update(
+                    trainer.update_occupancy_gate(
+                        jump["code_jump_rate"], state.global_step
+                    )
+                )
+            if trainer is not None:
+                trainer._pending_opd_jump_metrics = jump
+            self._prev_codes = new_codes
+            self._prev_weights = new_weights
+
+        # Only rank 0 keeps the large code snapshots. Broadcast the tiny gate
+        # decision so every DDP rank chooses the same occupancy on the next step.
+        if (
+            trainer is not None
+            and getattr(trainer, "mixed_opd_mode", False)
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            device = next(model.parameters()).device
+            ratio = torch.tensor([trainer.online_ratio], device=device)
+            torch.distributed.broadcast(ratio, src=0)
+            trainer.online_ratio = float(ratio.item())
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None or not state.is_world_process_zero:
@@ -1206,6 +1321,19 @@ def format_openthoughts_sample(example):
     return {
         "messages": messages
     }
+
+
+def openthoughts_prompt_length(example, tokenizer):
+    """Tokenized prompt-only length, matching chat generation formatting."""
+    messages = format_openthoughts_sample(example["conversations"])["messages"]
+    if messages and messages[-1].get("role") == "assistant":
+        messages = messages[:-1]
+    token_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    return len(token_ids)
 
 def extract_boxed_answer(text: str) -> str:
     """
@@ -1455,6 +1583,15 @@ def main():
 
     parser.add_argument("--kd_loss_type", type=str, default="jsd", choices=["jsd", "cakld", "forward_kl"], help="Knowledge distillation loss type: 'jsd' for generalized_jsd_loss, 'cakld' for cakld_loss, 'forward_kl' for OPD KL(teacher||student)")
     parser.add_argument("--opd", action="store_true", help="On-policy distillation: student rollouts + sampled reverse-KL policy gradient, matching slime OPD.")
+    parser.add_argument("--mixed_opd", action="store_true", help="Mix offline forward-KL steps with online sampled-reverse-KL steps.")
+    parser.add_argument("--online_ratio", type=float, default=0.25, help="Mixed OPD initial online-step ratio.")
+    parser.add_argument("--gate_soft_threshold", type=float, default=0.05, help="Raise online ratio below this code-jump EMA.")
+    parser.add_argument("--gate_hard_threshold", type=float, default=0.08, help="Lower online ratio at or above this code-jump EMA.")
+    parser.add_argument("--gate_ratio_step", type=float, default=0.25, help="Mixed OPD online-ratio increment/decrement.")
+    parser.add_argument("--gate_interval", type=int, default=5, help="Optimizer steps between gate decisions; 0 fixes the initial ratio.")
+    parser.add_argument("--gate_patience", type=int, default=2, help="Stable gate windows required before raising online ratio.")
+    parser.add_argument("--gate_start_step", type=int, default=30, help="First optimizer step allowed to change online ratio.")
+    parser.add_argument("--gate_ema_beta", type=float, default=0.9, help="EMA beta for code-jump gating.")
     parser.add_argument("--pv_opd", action="store_true", help="PV-OPD FullPair: gate sampled reverse-KL with a shared-range precision probe.")
     parser.add_argument("--pv_probe_bits", type=int, default=4, help="Precision-probe bitwidth for PV-OPD.")
     parser.add_argument("--pv_gate_mode", choices=["full", "sign", "shuffled"], default="full", help="PV gate or gate ablation.")
@@ -1472,8 +1609,23 @@ def main():
     device = torch.device("cuda", local_rank)
     # device name print
     args = parser.parse_args()
-    if args.opd and args.pv_opd:
-        parser.error("--opd and --pv_opd are mutually exclusive")
+    if sum((args.opd, args.mixed_opd, args.pv_opd)) > 1:
+        parser.error("--opd, --mixed_opd, and --pv_opd are mutually exclusive")
+    if args.mixed_opd and (
+        args.kd_loss_type != "forward_kl"
+        or args.cross_entropy_weight != 0.0
+        or not 0.0 < args.online_ratio <= 1.0
+        or not 0.0 < args.gate_ratio_step <= 1.0
+        or not 0.0 <= args.gate_soft_threshold < args.gate_hard_threshold
+        or not 0.0 <= args.gate_ema_beta < 1.0
+        or args.gate_interval < 0
+        or args.gate_patience < 1
+        or args.gate_start_step < 0
+    ):
+        parser.error(
+            "Mixed OPD requires forward_kl, CE=0, 0<online_ratio/ratio_step<=1, "
+            "0<=soft<hard, 0<=ema_beta<1, interval/start>=0, and patience>=1"
+        )
     if args.pv_opd and args.enable_efficient_qat:
         parser.error("PV-OPD FullPair cannot use --enable_efficient_qat")
     if args.pv_opd and args.pv_probe_bits <= args.wbits:
@@ -1486,7 +1638,7 @@ def main():
         parser.error(
             "PV-OPD requires --cross_entropy_weight 0 and no auxiliary CE loss"
         )
-    on_policy_mode = args.opd or args.pv_opd
+    on_policy_mode = args.opd or args.mixed_opd or args.pv_opd
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1665,6 +1817,27 @@ def main():
 
     logger.info(f"Dataset selection: start_index={args.dataset_start_index}, requested_size={args.dataset_size}")
     logger.info(f"Dataset selection: actual_end_index={actual_end_index}, selected_samples={len(dataset)}")
+    if on_policy_mode:
+        prompt_cap = int(args.max_length or 8192) - int(args.min_rollout_tokens)
+        before_filter = len(dataset)
+        dataset = dataset.map(
+            lambda example: {
+                "_opd_prompt_length": openthoughts_prompt_length(example, tokenizer)
+            },
+            desc="Measuring OPD prompt lengths",
+        )
+        max_prompt_before = max(dataset["_opd_prompt_length"], default=0)
+        dataset = dataset.filter(
+            lambda example: example["_opd_prompt_length"] <= prompt_cap,
+            desc="Filtering OPD prompts without rollout room",
+        )
+        max_prompt_after = max(dataset["_opd_prompt_length"], default=0)
+        dataset = dataset.remove_columns("_opd_prompt_length")
+        logger.info(
+            f"OPD prompt filter: before={before_filter} after={len(dataset)} "
+            f"filtered={before_filter - len(dataset)} cap={prompt_cap} "
+            f"max_before={max_prompt_before} max_after={max_prompt_after}"
+        )
     # apply chat template to prompt
     # dataset = dataset.map(partial(apply_chat_template, tokenizer=tokenizer))
     # print(dataset[0]["messages"])
@@ -1788,6 +1961,15 @@ def main():
         kd_loss_type=args.kd_loss_type,
         mean_prob=mean_prob,
         opd_mode=on_policy_mode,
+        mixed_opd_mode=args.mixed_opd,
+        online_ratio=args.online_ratio,
+        gate_soft_threshold=args.gate_soft_threshold,
+        gate_hard_threshold=args.gate_hard_threshold,
+        gate_ratio_step=args.gate_ratio_step,
+        gate_interval=args.gate_interval,
+        gate_patience=args.gate_patience,
+        gate_start_step=args.gate_start_step,
+        gate_ema_beta=args.gate_ema_beta,
         pv_opd_mode=args.pv_opd,
         pv_probe_bits=args.pv_probe_bits,
         pv_gate_mode=args.pv_gate_mode,
@@ -1824,10 +2006,14 @@ def main():
         trainer.generation_config.max_length = args.max_length or 8192
         trainer.generation_config.use_cache = True
         logger.info(
-            f"{'PV-OPD' if args.pv_opd else 'OPD'} enabled: student rollout lmbda=1 "
+            f"{'PV-OPD' if args.pv_opd else 'Mixed-OPD' if args.mixed_opd else 'OPD'} enabled: "
+            f"student rollout lmbda=1 "
             f"max_length={trainer.generation_config.max_length} kd_loss_type={args.kd_loss_type} "
             f"top_k={args.top_k} ce_weight={args.cross_entropy_weight} "
-            f"probe_bits={args.pv_probe_bits if args.pv_opd else 'none'}"
+            f"probe_bits={args.pv_probe_bits if args.pv_opd else 'none'} "
+            f"online_ratio={args.online_ratio if args.mixed_opd else 1.0} "
+            f"gate={args.gate_soft_threshold}/{args.gate_hard_threshold} "
+            f"interval={args.gate_interval} start={args.gate_start_step}"
         )
 
     if trainer.is_world_process_zero():
