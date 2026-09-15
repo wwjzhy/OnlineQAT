@@ -1306,9 +1306,10 @@ output/plots/<FIXED|GATED>/opd_timeline.csv
 
 ## Exp #19（2026-09-14 新增）— 对比 W2-OPD 的 decay70 与 stable55 训练统计
 
-**目标：** 不重训，只汇总已有的两条 W2-OPD 轨迹，判断 stable 相比 decay
-是否真的降低了梯度/跳码波动，并对应到 GSM8K、MATH-500。主比较使用共同终点
-step 85；不能拿 stable 的 step 85 直接和 decay 的 step 100 下结论。
+**目标：** 不重训，按每 5 optimizer steps 汇总已有的两条 W2-OPD 轨迹，
+判断 stable 相比 decay 是否真的降低了梯度/跳码波动，并对应到同 checkpoint
+的 GSM8K、MATH-500。主比较使用共同终点 step 85；不能拿 stable 的 step 85
+直接和 decay 的 step 100 下结论。
 
 | 简称 | 数据组成 | 实际 schedule |
 |---|---|---|
@@ -1323,13 +1324,16 @@ step 按字段保留最后一次记录；最终 `train_runtime` 等稀疏日志�
 
 - 完整 schedule：decay70 统计 step 1–100；stable55 统计拼接后的 step 1–85。
 - tail 主分析：decay70 统计 step 31–100；stable55 统计 step 31–85。
+- **每 5 steps 主表：** checkpoint 5 对应 step 1–5，checkpoint 35 对应
+  step 31–35，以此类推；decay 输出到 100，stable 输出到 85。不能只抽取
+  checkpoint 当步的瞬时训练值。
 - LR、loss、response length、EOS、truncation 报 step 宏平均；grad norm、code
   jump、code-jump amplification 报均值 / P95 / 最大值。P95 用线性插值。
 - `code_jump_rate`、`eos_rate`、`truncation_rate` 以百分数报告；amplification
   为无量纲比值。每项同时打印有效 step 数，数量不足时不填结果。
 - 评测协议沿用原实验：thinking on、`T=0.6`、`top_k=20`、
-  `max_tokens=8192`。共同 checkpoint 报 35/50/75/85；另报共享起点 30 和
-  decay 最终点 100。
+  `max_tokens=8192`。decay 每 5 steps 评到 100；stable 的 1–30 与 decay
+  共用结果，独立分支从 35 每 5 steps 评到 85。
 
 **依赖：** `#10` 的完整 JSONL / checkpoints，以及 `#15` 至少训练并保存到
 step 85。没有 step 85 就先补完 `#15`，不要用插值后的 benchmark 分数。
@@ -1348,16 +1352,17 @@ test -f "log/distill/${STABLE}/opd_step_metrics.jsonl"
 test -d "output/distill/${DECAY}/checkpoint-85"
 test -d "output/distill/${STABLE}/checkpoint-85"
 
-# 补齐同 step 评测；已有结果会复用。step 30 是两条分支的共享起点。
+# 补齐每 5-step 评测；已有结果会复用。step 5–30 是两条分支的共享 warmup。
 KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
   bash scripts/eval_distill_checkpoints.sh \
   --watch-dir "output/distill/${DECAY}" --wbits 2 --eval-gpu 0 \
-  --steps 30,35,50,75,85,100 --skip-final
+  --steps 5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100 \
+  --skip-final
 
 KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
   bash scripts/eval_distill_checkpoints.sh \
   --watch-dir "output/distill/${STABLE}" --wbits 2 --eval-gpu 0 \
-  --steps 35,50,75,85 --skip-final
+  --steps 35,40,45,50,55,60,65,70,75,80,85 --skip-final
 
 python scripts/merge_opd_timeline.py \
   --metrics "log/distill/${DECAY}/opd_step_metrics.jsonl" \
@@ -1369,7 +1374,7 @@ python scripts/merge_opd_timeline.py \
   --eval-root "output/eval/${STABLE}" \
   --out-dir "output/plots/${STABLE}"
 
-# 打印完整 schedule 和 tail 两张 Markdown 表；只使用 Python 标准库。
+# 打印全程摘要、每 5-step 统计和 checkpoint 评测表；只使用 Python 标准库。
 python - <<'PY'
 import json
 import math
@@ -1424,7 +1429,7 @@ def report(name, rows, lo, hi):
         raise SystemExit(f"{name} step {lo}-{hi}: missing metrics: {counts}")
     mean = lambda v: sum(v) / len(v)
     return {
-        "run": name, "steps": f"{lo}-{hi}", "n": required,
+        "run": name, "steps": f"{lo}-{hi}", "ckpt": hi, "n": required,
         "lr_mean": fmt(mean(xs["lr"])), "loss_mean": fmt(mean(xs["loss"])),
         "grad_mean": fmt(mean(xs["grad"])),
         "grad_p95": fmt(pct95(xs["grad"])), "grad_max": fmt(max(xs["grad"])),
@@ -1442,37 +1447,52 @@ d, s = load(decay), load(stable)
 stable_full = {k: v for k, v in d.items() if 1 <= k <= 30}
 stable_full.update({k: v for k, v in s.items() if 31 <= k <= 85})
 
-rows = []
+summary_rows = []
 for scope, reports in [
     ("完整 schedule", [report("decay70", d, 1, 100),
                        report("stable55", stable_full, 1, 85)]),
     ("tail（主分析）", [report("decay70", d, 31, 100),
                        report("stable55", s, 31, 85)]),
 ]:
-    rows.extend({"scope": scope, **row} for row in reports)
+    summary_rows.extend({"scope": scope, **row} for row in reports)
 
-def table(title, columns):
+window_rows = []
+for name, data, stop in [("decay70", d, 100),
+                         ("stable55", stable_full, 85)]:
+    window_rows.extend(report(name, data, end - 4, end)
+                       for end in range(5, stop + 1, 5))
+
+def table(title, table_rows, columns):
     print(f"\n### {title}\n")
     print("| " + " | ".join(label for _, label in columns) + " |")
     print("|" + "---|" * len(columns))
-    for row in rows:
+    for row in table_rows:
         print("| " + " | ".join(str(row[key]) for key, _ in columns) + " |")
 
-base = [("scope", "统计区间"), ("run", "run"), ("steps", "steps"), ("n", "n")]
-table("表 1：优化状态", base + [
+summary_base = [("scope", "统计区间"), ("run", "run"),
+                ("steps", "steps"), ("n", "n")]
+window_base = [("ckpt", "checkpoint"), ("run", "run"),
+               ("steps", "统计 steps")]
+optimization = [
     ("lr_mean", "LR mean"), ("loss_mean", "loss mean"),
     ("grad_mean", "grad mean"), ("grad_p95", "grad P95"),
     ("grad_max", "grad max"),
-])
-table("表 2：量化稳定性", base + [
+]
+quantization = [
     ("jump_mean", "jump mean"), ("jump_p95", "jump P95"),
     ("jump_max", "jump max"), ("amp_mean", "amp mean"),
     ("amp_p95", "amp P95"), ("amp_max", "amp max"),
-])
-table("表 3：Rollout 状态", base + [
+]
+rollout = [
     ("response_mean", "response length mean"),
     ("eos_mean", "EOS mean"), ("trunc_mean", "truncation mean"),
-])
+]
+table("表 1：优化状态摘要", summary_rows, summary_base + optimization)
+table("表 2：每 5 steps 优化状态", window_rows, window_base + optimization)
+table("表 3：量化稳定性摘要", summary_rows, summary_base + quantization)
+table("表 4：每 5 steps 量化稳定性", window_rows, window_base + quantization)
+table("表 5：Rollout 状态摘要", summary_rows, summary_base + rollout)
+table("表 6：每 5 steps Rollout 状态", window_rows, window_base + rollout)
 
 def eval_score(tag, step, dataset):
     scores = load_eval_scores_for_step(Path("output/eval") / tag, step)
@@ -1489,11 +1509,11 @@ def eval_score(tag, step, dataset):
     value = 100 * value if abs(value) <= 1 else value
     return f"{value:.2f}"
 
-print("\n### 表 4：GSM8K / MATH-500 checkpoints\n")
+print("\n### 表 7：每 5 steps 的 GSM8K / MATH-500\n")
 print("| step | decay GSM8K | decay MATH-500 | stable GSM8K | stable MATH-500 |")
 print("|---:|---:|---:|---:|---:|")
-for step in (30, 35, 50, 75, 85, 100):
-    stable_tag = decay if step == 30 else stable
+for step in range(5, 101, 5):
+    stable_tag = decay if step <= 30 else stable
     stable_scores = ([eval_score(stable_tag, step, ds)
                       for ds in ("gsm8k", "math_500")]
                      if step <= 85 else ["—", "—"])
@@ -1503,17 +1523,15 @@ for step in (30, 35, 50, 75, 85, 100):
 PY
 ```
 
-把脚本输出的四张表填回本节。表 1 回答优化是否稳定，表 2 回答极低 bit
-跳码是否受控，表 3 检查 rollout 分布是否改变，表 4 对应最终任务效果：
+把脚本输出的七张表填回本节。摘要表用于总体结论；每 5-step 表用于检查
+“grad/jump 尖峰 → rollout 改变 → 后续 benchmark 改变”的时间顺序。表 7 格式：
 
 | step | decay70 GSM8K | decay70 MATH-500 | stable55 GSM8K | stable55 MATH-500 |
 |---:|---:|---:|---:|---:|
-| 30（共享起点） | 待填 | 待填 | 同左 | 同左 |
-| 35 | 待填 | 待填 | 待填 | 待填 |
-| 50 | 待填 | 待填 | 待填 | 待填 |
-| 75 | 待填 | 待填 | 待填 | 待填 |
+| 5–30（每 5 step） | 待填 | 待填 | 同左 | 同左 |
+| 35–80（每 5 step） | 待填 | 待填 | 待填 | 待填 |
 | **85（主比较）** | **待填** | **待填** | **待填** | **待填** |
-| 100（仅 decay） | 待填 | 待填 | — | — |
+| 90–100（每 5 step，仅 decay） | 待填 | 待填 | — | — |
 
 **结论门槛：** 只有 stable 在共同 step 85 的 GSM8K/MATH-500 不差、且 tail
 的 grad norm 或 code jump 的 P95/最大值明显更低，才支持“stable 提高训练稳定性”。
