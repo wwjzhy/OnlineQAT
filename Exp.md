@@ -1546,6 +1546,127 @@ output/plots/${STABLE}/opd_timeline.{csv,jsonl}
 
 ---
 
+## Exp #20（2026-09-15 新增）— W2-OPD stable step 70–85 完整 benchmark
+
+**目标：** 不重训。对 `#15/#19` 的 W2-OPD stable55 分支中
+checkpoint 70/75/80/85 跑完整 8 项 benchmark，判断 GSM8K/MATH-500 的最佳
+窗口是否同时改善通用知识、代码、指令遵循和困难推理，避免只凭两个任务选择
+checkpoint。
+
+完整套件固定为：GSM8K、AIME24、AIME25、MATH-500、LiveCodeBench、
+MMLU-Redux、GPQA-Diamond、IFEval。评测配置与公共约定一致：thinking on、
+`T=0.6`、`top_k=20`、`max_tokens=8192`。四个 checkpoint 必须使用完全相同的
+配置；不要设置 `LIMIT`，也不要设置 `EVAL_DATASETS` 子集。
+
+**依赖：** 以下四个评测快照均存在且带 `.ready`：
+
+```
+output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-{70,75,80,85}
+```
+
+**状态：** 未跑。只做 checkpoint 转换和评测，不启动 Stage 1/2。已有
+GSM8K/MATH-500 的 `.eval_done` 是子集评测标记，必须清掉；完整结果写入新的
+`-fullbench70to85` tag，不覆盖 Exp #19 的双任务结果。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+STABLE=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+FULL_TAG=${STABLE}-fullbench70to85
+
+for STEP in 70 75 80 85; do
+  test -f "output/distill/${STABLE}/checkpoint-${STEP}/config.json"
+  test -f "output/distill/${STABLE}/checkpoint-${STEP}/.ready"
+done
+
+# watcher 的完成标记不区分评测子集；清除这四个旧标记后才能补跑完整套件。
+rm -f output/distill/${STABLE}/checkpoint-{70,75,80,85}/.eval_done
+unset EVAL_DATASETS LIMIT
+
+KEEP_CHECKPOINTS=1 \
+ENABLE_THINKING=1 \
+MAX_TOKENS=8192 \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${STABLE}" \
+  --tag "${FULL_TAG}" \
+  --wbits 2 --eval-gpu 0 \
+  --steps 70,75,80,85 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${STABLE}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${FULL_TAG}" \
+  --out-dir "output/plots/${FULL_TAG}"
+
+# 打印完整结果表；paper avg 只平均论文主表五任务：
+# MATH-500 / LCB / MMLU-R / GPQA-D / IFEval。
+python - <<'PY'
+from pathlib import Path
+from quantize.opd_metrics import load_eval_scores_for_step
+
+tag = ("Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-"
+       "from30hold-fullbench70to85")
+datasets = [
+    ("gsm8k", "GSM8K"), ("aime24", "AIME24"),
+    ("aime25", "AIME25"), ("math_500", "MATH-500"),
+    ("live_code_bench", "LCB"), ("mmlu_redux", "MMLU-R"),
+    ("gpqa_diamond", "GPQA-D"), ("ifeval", "IFEval"),
+]
+paper_tasks = {"math_500", "live_code_bench", "mmlu_redux",
+               "gpqa_diamond", "ifeval"}
+
+def score(scores, dataset):
+    candidates = [(key, value) for key, value in scores.items()
+                  if dataset in key.lower()]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (
+        not item[0].lower().endswith(
+            ("accuracy", "score", "exact_match", "pass@1", "pass_at_1")
+        ),
+        len(item[0]),
+    ))
+    value = float(candidates[0][1])
+    return 100 * value if abs(value) <= 1 else value
+
+header = ["ckpt", *[label for _, label in datasets], "paper-5 avg"]
+print("| " + " | ".join(header) + " |")
+print("|" + "---:|" * len(header))
+for step in (70, 75, 80, 85):
+    scores = load_eval_scores_for_step(Path("output/eval") / tag, step)
+    values = {name: score(scores, name) for name, _ in datasets}
+    main = [values[name] for name in paper_tasks]
+    avg = sum(main) / len(main) if all(v is not None for v in main) else None
+    row = [str(step), *[("—" if values[name] is None else f"{values[name]:.2f}")
+                        for name, _ in datasets],
+           "—" if avg is None else f"{avg:.2f}"]
+    print("| " + " | ".join(row) + " |")
+PY
+```
+
+把输出填回本节：
+
+| ckpt | GSM8K | AIME24 | AIME25 | MATH-500 | LCB | MMLU-R | GPQA-D | IFEval | paper-5 avg |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 70 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| 75 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| 80 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| 85 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+
+**选择规则：** 主 checkpoint 按 `paper-5 avg` 选择，不按 GSM8K/MATH-500
+两任务均值选择。四个点全部报告；若差异小于约 1 pt，至少重复评测候选最佳点，
+不要把采样噪声写成确定提升。
+
+产出：
+
+```
+output/eval/${FULL_TAG}/checkpoint-{70,75,80,85}
+output/plots/${FULL_TAG}/opd_timeline.{csv,jsonl}
+log/eval/${FULL_TAG}/watcher.log
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
