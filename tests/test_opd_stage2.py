@@ -257,6 +257,28 @@ def test_mixed_opd_gate_schedule():
     assert out["online_ratio"] == 0.25
 
 
+def test_short_opd_controller_shrinks_on_repetition():
+    trainer = PolicyGKDTrainer.__new__(PolicyGKDTrainer)
+    trainer.short_opd_mode = True
+    trainer.short_opd_min_tokens = 1024
+    trainer.short_opd_max_tokens = 8192
+    trainer.short_opd_rho_low = 0.20
+    trainer.short_opd_rho_high = 0.45
+    trainer.short_opd_truncation_threshold = 0.10
+    trainer.short_opd_margin = 1.15
+    trainer.short_opd_growth = 1.25
+    trainer.short_opd_stat_ema = 0.70
+    trainer.short_opd_budget_ema = 0.70
+    trainer.short_opd_budget = 8192
+    trainer._short_opd_data_step = 0
+    trainer._short_opd_accum = [
+        {"repetition": 0.75, "truncation": 0.0, "length": 1024.0}
+    ]
+    trainer._short_opd_ema = {"repetition": None, "truncation": None, "length": None}
+    trainer._advance_short_opd_controller(1)
+    assert trainer.short_opd_budget == 6080
+
+
 def test_opd_replaces_batch_with_student_rollout_and_masks_prompt():
     torch.manual_seed(3)
     model = TinyLM()
@@ -323,6 +345,7 @@ def test_scripts_gkd_vs_opd_flags():
     assert "--cross_entropy_weight 0.0" in opd
     assert "OPD_FLAGS=(--opd)" in opd
     assert "--mixed_opd" in opd
+    assert "--short_opd" in opd
     assert '--top_k "${TOP_K}"' in opd
     assert "sampled reverse KL" in opd
     assert "block_qat" in opd
@@ -493,6 +516,7 @@ if __name__ == "__main__":
         test_compute_loss_ce0_has_no_ce_graph,
         test_mixed_opd_offline_step_uses_forward_kl,
         test_mixed_opd_gate_schedule,
+        test_short_opd_controller_shrinks_on_repetition,
         test_opd_replaces_batch_with_student_rollout_and_masks_prompt,
         test_generation_budget_is_total_max_length_not_extra_new_tokens,
         test_opd_masks_keep_first_eos_and_drop_later_padding,

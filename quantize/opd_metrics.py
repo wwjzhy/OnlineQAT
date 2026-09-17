@@ -81,6 +81,70 @@ def rollout_truncation_metrics(
 
 
 @torch.no_grad()
+def short_opd_rollout_metrics(
+    response_tokens: torch.Tensor,
+    response_mask: torch.Tensor,
+    rollout_budget: int,
+) -> dict[str, float]:
+    """ShortOPD's token-only terminal-loop statistics for one microbatch.
+
+    This implements the paper's structural detector.  It intentionally omits
+    the optional teacher-loss boundary refinement; detected loop tokens remain
+    in the OPD loss and only steer the next rollout budget.
+    """
+    if response_tokens.ndim != 2 or response_mask.shape != response_tokens.shape:
+        raise ValueError("response_tokens/response_mask must be matching [batch, seq]")
+
+    repeated = 0
+    clean_truncated = 0
+    effective_lengths = []
+    for tokens, mask in zip(response_tokens, response_mask.to(torch.bool)):
+        valid = tokens[mask]
+        response_len = int(valid.numel())
+        suffix = valid[-512:]
+        n = int(suffix.numel())
+        best = None
+        for period in range(1, min(10, n - 1) + 1):
+            matches = (suffix[period:] == suffix[:-period]).float()
+            anchor = min(32, int(matches.numel()))
+            if anchor == 0 or float(matches[-anchor:].mean().item()) < 0.9:
+                continue
+            reverse_mean = matches.flip(0).cumsum(0) / torch.arange(
+                1, matches.numel() + 1, device=matches.device
+            )
+            candidates = (reverse_mean >= 0.9).nonzero(as_tuple=True)[0]
+            if candidates.numel() == 0:
+                continue
+            matched_tail = int(candidates[-1].item()) + 1
+            tail = matched_tail + period
+            agreement = float(reverse_mean[matched_tail - 1].item())
+            severe = (
+                tail >= 64
+                and tail / period >= 3
+                and (tail >= 128 or tail / max(1, n) >= 0.30)
+            )
+            candidate = (tail, agreement, -period)
+            if severe and (best is None or candidate > best):
+                best = candidate
+
+        is_repeated = best is not None
+        repeated += int(is_repeated)
+        effective_lengths.append(
+            max(0, response_len - best[0]) if is_repeated else response_len
+        )
+        clean_truncated += int(
+            not is_repeated and response_len >= int(rollout_budget)
+        )
+
+    batch = max(1, int(response_tokens.shape[0]))
+    return {
+        "shortopd_repetition_rate": repeated / batch,
+        "shortopd_clean_truncation_rate": clean_truncated / batch,
+        "shortopd_effective_length": sum(effective_lengths) / batch,
+    }
+
+
+@torch.no_grad()
 def snapshot_quant_codes(model) -> dict[str, torch.Tensor]:
     """CPU int16 codes for every QuantLinear (rank-0 diagnostics)."""
     from quantize.int_linear_fake import QuantLinear

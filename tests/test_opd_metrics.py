@@ -15,6 +15,7 @@ from quantize.opd_metrics import (
     code_jump_rate,
     merge_timeline,
     rollout_truncation_metrics,
+    short_opd_rollout_metrics,
 )
 from quantize.quantizer import UniformAffineQuantizer
 
@@ -48,6 +49,17 @@ def test_truncation_eos_not_counted():
     )
     assert m["truncation_rate"] == 0.0
     assert m["eos_rate"] == 1.0
+
+
+def test_short_opd_detects_terminal_loop_and_clean_truncation():
+    loop = torch.cat([torch.arange(100), torch.tensor(([7, 8] * 80)[:160])])
+    clean = torch.arange(260)
+    tokens = torch.stack([loop, clean])
+    mask = torch.ones_like(tokens, dtype=torch.bool)
+    m = short_opd_rollout_metrics(tokens, mask, rollout_budget=260)
+    assert m["shortopd_repetition_rate"] == 0.5
+    assert m["shortopd_clean_truncation_rate"] == 0.5
+    assert 150.0 < m["shortopd_effective_length"] < 200.0
 
 
 def test_integer_codes_and_jump():

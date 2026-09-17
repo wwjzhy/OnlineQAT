@@ -45,6 +45,7 @@ from quantize.opd_metrics import (
     master_rel_change,
     reduce_mean_scalar,
     rollout_truncation_metrics,
+    short_opd_rollout_metrics,
     snapshot_quant_codes,
 )
 import types
@@ -211,6 +212,16 @@ class PolicyGKDTrainer(GKDTrainer):
         gate_patience=2,
         gate_start_step=30,
         gate_ema_beta=0.9,
+        short_opd_mode=False,
+        short_opd_min_tokens=1024,
+        short_opd_max_tokens=8192,
+        short_opd_rho_low=0.20,
+        short_opd_rho_high=0.45,
+        short_opd_truncation_threshold=0.10,
+        short_opd_margin=1.15,
+        short_opd_growth=1.25,
+        short_opd_stat_ema=0.70,
+        short_opd_budget_ema=0.70,
         pv_opd_mode=False,
         pv_probe_bits=4,
         pv_gate_mode="full",
@@ -243,6 +254,24 @@ class PolicyGKDTrainer(GKDTrainer):
         self.gate_ema_beta = float(gate_ema_beta)
         self._gate_jump_ema = None
         self._gate_stable_windows = 0
+        self.short_opd_mode = bool(short_opd_mode)
+        self.short_opd_min_tokens = int(short_opd_min_tokens)
+        self.short_opd_max_tokens = int(short_opd_max_tokens)
+        self.short_opd_rho_low = float(short_opd_rho_low)
+        self.short_opd_rho_high = float(short_opd_rho_high)
+        self.short_opd_truncation_threshold = float(short_opd_truncation_threshold)
+        self.short_opd_margin = float(short_opd_margin)
+        self.short_opd_growth = float(short_opd_growth)
+        self.short_opd_stat_ema = float(short_opd_stat_ema)
+        self.short_opd_budget_ema = float(short_opd_budget_ema)
+        self.short_opd_budget = self.short_opd_max_tokens
+        self._short_opd_data_step = None
+        self._short_opd_accum = []
+        self._short_opd_ema = {
+            "repetition": None,
+            "truncation": None,
+            "length": None,
+        }
         self._current_batch_on_policy = bool(opd_mode and not mixed_opd_mode)
         self.pv_opd_mode = pv_opd_mode
         self.pv_probe_bits = pv_probe_bits
@@ -312,6 +341,67 @@ class PolicyGKDTrainer(GKDTrainer):
             "gate_action": float(action),
             "gate_stable_windows": float(self._gate_stable_windows),
         }
+
+    def _advance_short_opd_controller(self, step):
+        """Update the response budget once from the prior optimizer step."""
+        if not getattr(self, "short_opd_mode", False):
+            return
+        step = int(step)
+        if self._short_opd_data_step is None:
+            self._short_opd_data_step = step
+            return
+        if step == self._short_opd_data_step:
+            return
+        if self._short_opd_accum:
+            values = {
+                key: sum(row[key] for row in self._short_opd_accum)
+                / len(self._short_opd_accum)
+                for key in ("repetition", "truncation", "length")
+            }
+            beta = self.short_opd_stat_ema
+            for key, value in values.items():
+                old = self._short_opd_ema[key]
+                self._short_opd_ema[key] = (
+                    value if old is None else beta * old + (1.0 - beta) * value
+                )
+
+            target = float(self.short_opd_budget)
+            if self._short_opd_ema["repetition"] > self.short_opd_rho_high:
+                target = min(
+                    target,
+                    self.short_opd_margin * self._short_opd_ema["length"],
+                )
+            elif (
+                self._short_opd_ema["repetition"] < self.short_opd_rho_low
+                and self._short_opd_ema["truncation"]
+                > self.short_opd_truncation_threshold
+            ):
+                target *= self.short_opd_growth
+            mixed = (
+                self.short_opd_budget_ema * self.short_opd_budget
+                + (1.0 - self.short_opd_budget_ema) * target
+            )
+            rounded = int(round(mixed / 16.0) * 16)
+            self.short_opd_budget = min(
+                self.short_opd_max_tokens,
+                max(self.short_opd_min_tokens, rounded),
+            )
+        self._short_opd_accum = []
+        self._short_opd_data_step = step
+
+    def short_opd_state_dict(self):
+        return {
+            "budget": self.short_opd_budget,
+            "data_step": self._short_opd_data_step,
+            "accum": self._short_opd_accum,
+            "ema": self._short_opd_ema,
+        }
+
+    def load_short_opd_state_dict(self, state):
+        self.short_opd_budget = int(state["budget"])
+        self._short_opd_data_step = state.get("data_step")
+        self._short_opd_accum = list(state.get("accum", []))
+        self._short_opd_ema.update(state.get("ema", {}))
 
     @staticmethod
     def forward_kl_loss(student_logits, teacher_logits, labels=None, temperature=1.0, top_k=None):
@@ -583,6 +673,7 @@ class PolicyGKDTrainer(GKDTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Use student rollouts on online steps and gold trajectories otherwise."""
+        self._advance_short_opd_controller(self.state.global_step)
         self._current_batch_on_policy = self.use_on_policy_batch()
         if self.mixed_opd_mode:
             self._pending_opd_rollout_metrics = {
@@ -671,13 +762,24 @@ class PolicyGKDTrainer(GKDTrainer):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             rollout_t0 = time.perf_counter()
+            batch_rollout_budget = max_length - int(prompts.shape[1])
+            old_max_new_tokens = self.generation_config.max_new_tokens
+            if getattr(self, "short_opd_mode", False):
+                batch_rollout_budget = min(
+                    int(self.short_opd_budget),
+                    batch_rollout_budget,
+                )
+                self.generation_config.max_new_tokens = batch_rollout_budget
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 # train() + gradient checkpointing forces use_cache=False (O(T^2) decode).
                 # Fake-quant also re-rounds full W every token unless cached.
-                with opd_generate_context(unwrapped_model):
-                    new_input_ids, _, _ = self.generate_on_policy_outputs(
-                        unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
-                    )
+                try:
+                    with opd_generate_context(unwrapped_model):
+                        new_input_ids, _, _ = self.generate_on_policy_outputs(
+                            unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
+                        )
+                finally:
+                    self.generation_config.max_new_tokens = old_max_new_tokens
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             rollout_seconds = float(time.perf_counter() - rollout_t0)
@@ -691,13 +793,48 @@ class PolicyGKDTrainer(GKDTrainer):
                 generated_tokens=new_input_ids,
                 prompt_attention_mask=prompt_attention_mask,
                 eos_token_id=self.generation_config.eos_token_id,
-                max_length=max_length,
+                max_length=(
+                    int(prompts.shape[1]) + batch_rollout_budget
+                    if getattr(self, "short_opd_mode", False)
+                    else max_length
+                ),
                 pad_token_id=self.processing_class.pad_token_id,
             )
             device = new_input_ids.device
             reduced = {
                 key: reduce_mean_scalar(val, device) for key, val in local_metrics.items()
             }
+            if getattr(self, "short_opd_mode", False):
+                response_tokens = new_input_ids[:, prompts.shape[1]:]
+                response_mask = new_labels[:, prompts.shape[1]:] != -100
+                short_metrics = short_opd_rollout_metrics(
+                    response_tokens,
+                    response_mask,
+                    rollout_budget=batch_rollout_budget,
+                )
+                short_reduced = {
+                    key: reduce_mean_scalar(val, device)
+                    for key, val in short_metrics.items()
+                }
+                self._short_opd_accum.append({
+                    "repetition": short_reduced["shortopd_repetition_rate"],
+                    "truncation": short_reduced["shortopd_clean_truncation_rate"],
+                    "length": short_reduced["shortopd_effective_length"],
+                })
+                n_short = len(self._short_opd_accum)
+                reduced.update({
+                    "shortopd_repetition_rate": sum(
+                        row["repetition"] for row in self._short_opd_accum
+                    ) / n_short,
+                    "shortopd_clean_truncation_rate": sum(
+                        row["truncation"] for row in self._short_opd_accum
+                    ) / n_short,
+                    "shortopd_effective_length": sum(
+                        row["length"] for row in self._short_opd_accum
+                    ) / n_short,
+                    "shortopd_budget": float(self.short_opd_budget),
+                    "shortopd_batch_budget": float(batch_rollout_budget),
+                })
             # Sum microbatch rollout wall times within one optimizer step (grad accum).
             reduced["rollout_seconds"] = float(
                 getattr(self, "_accum_opd_rollout_seconds", 0.0) + rollout_seconds
@@ -1101,6 +1238,20 @@ class QuantEvalSnapshotCallback(TrainerCallback):
             save_quantized_eval_checkpoint(unwrapped, self.tokenizer, ckpt_dir)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+
+class ShortOpdStateCallback(TrainerCallback):
+    """Store the adaptive horizon beside each resumable Trainer checkpoint."""
+
+    def __init__(self, trainer_ref_holder):
+        self._holder = trainer_ref_holder
+
+    def on_save(self, args, state, control, **kwargs):
+        trainer = self._holder.get("trainer")
+        if not trainer or not trainer.short_opd_mode or not state.is_world_process_zero:
+            return
+        path = Path(args.output_dir) / f"checkpoint-{state.global_step}" / "short_opd_state.json"
+        path.write_text(json.dumps(trainer.short_opd_state_dict(), indent=2) + "\n")
 
 
 class OpdMetricsCallback(TrainerCallback):
@@ -1583,6 +1734,16 @@ def main():
 
     parser.add_argument("--kd_loss_type", type=str, default="jsd", choices=["jsd", "cakld", "forward_kl"], help="Knowledge distillation loss type: 'jsd' for generalized_jsd_loss, 'cakld' for cakld_loss, 'forward_kl' for OPD KL(teacher||student)")
     parser.add_argument("--opd", action="store_true", help="On-policy distillation: student rollouts + sampled reverse-KL policy gradient, matching slime OPD.")
+    parser.add_argument("--short_opd", action="store_true", help="OPD with a ShortOPD-inspired repetition-gated adaptive response budget.")
+    parser.add_argument("--short_opd_min_tokens", type=int, default=1024)
+    parser.add_argument("--short_opd_max_tokens", type=int, default=8192)
+    parser.add_argument("--short_opd_rho_low", type=float, default=0.20)
+    parser.add_argument("--short_opd_rho_high", type=float, default=0.45)
+    parser.add_argument("--short_opd_truncation_threshold", type=float, default=0.10)
+    parser.add_argument("--short_opd_margin", type=float, default=1.15)
+    parser.add_argument("--short_opd_growth", type=float, default=1.25)
+    parser.add_argument("--short_opd_stat_ema", type=float, default=0.70)
+    parser.add_argument("--short_opd_budget_ema", type=float, default=0.70)
     parser.add_argument("--mixed_opd", action="store_true", help="Mix offline forward-KL steps with online sampled-reverse-KL steps.")
     parser.add_argument("--online_ratio", type=float, default=0.25, help="Mixed OPD initial online-step ratio.")
     parser.add_argument("--gate_soft_threshold", type=float, default=0.05, help="Raise online ratio below this code-jump EMA.")
@@ -1609,8 +1770,18 @@ def main():
     device = torch.device("cuda", local_rank)
     # device name print
     args = parser.parse_args()
-    if sum((args.opd, args.mixed_opd, args.pv_opd)) > 1:
-        parser.error("--opd, --mixed_opd, and --pv_opd are mutually exclusive")
+    if sum((args.opd, args.short_opd, args.mixed_opd, args.pv_opd)) > 1:
+        parser.error("--opd, --short_opd, --mixed_opd, and --pv_opd are mutually exclusive")
+    if args.short_opd and not (
+        0 < args.short_opd_min_tokens <= args.short_opd_max_tokens <= (args.max_length or 8192)
+        and 0 <= args.short_opd_rho_low < args.short_opd_rho_high <= 1
+        and 0 <= args.short_opd_truncation_threshold <= 1
+        and args.short_opd_margin > 1
+        and args.short_opd_growth > 1
+        and 0 <= args.short_opd_stat_ema < 1
+        and 0 <= args.short_opd_budget_ema < 1
+    ):
+        parser.error("Invalid ShortOPD bounds, thresholds, growth, or EMA parameters")
     if args.mixed_opd and (
         args.kd_loss_type != "forward_kl"
         or args.cross_entropy_weight != 0.0
@@ -1638,7 +1809,7 @@ def main():
         parser.error(
             "PV-OPD requires --cross_entropy_weight 0 and no auxiliary CE loss"
         )
-    on_policy_mode = args.opd or args.mixed_opd or args.pv_opd
+    on_policy_mode = args.opd or args.short_opd or args.mixed_opd or args.pv_opd
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1951,6 +2122,8 @@ def main():
             f"OPD step metrics (truncation/code-jump/grad_norm) -> "
             f"{training_args.output_dir}/opd_step_metrics.jsonl"
         )
+    if args.short_opd:
+        callbacks.append(ShortOpdStateCallback(trainer_ref_holder))
 
     trainer = PolicyGKDTrainer(
         kl_weight=args.kl_weight,
@@ -1970,6 +2143,16 @@ def main():
         gate_patience=args.gate_patience,
         gate_start_step=args.gate_start_step,
         gate_ema_beta=args.gate_ema_beta,
+        short_opd_mode=args.short_opd,
+        short_opd_min_tokens=args.short_opd_min_tokens,
+        short_opd_max_tokens=args.short_opd_max_tokens,
+        short_opd_rho_low=args.short_opd_rho_low,
+        short_opd_rho_high=args.short_opd_rho_high,
+        short_opd_truncation_threshold=args.short_opd_truncation_threshold,
+        short_opd_margin=args.short_opd_margin,
+        short_opd_growth=args.short_opd_growth,
+        short_opd_stat_ema=args.short_opd_stat_ema,
+        short_opd_budget_ema=args.short_opd_budget_ema,
         pv_opd_mode=args.pv_opd,
         pv_probe_bits=args.pv_probe_bits,
         pv_gate_mode=args.pv_gate_mode,
@@ -2006,7 +2189,7 @@ def main():
         trainer.generation_config.max_length = args.max_length or 8192
         trainer.generation_config.use_cache = True
         logger.info(
-            f"{'PV-OPD' if args.pv_opd else 'Mixed-OPD' if args.mixed_opd else 'OPD'} enabled: "
+            f"{'ShortOPD' if args.short_opd else 'PV-OPD' if args.pv_opd else 'Mixed-OPD' if args.mixed_opd else 'OPD'} enabled: "
             f"student rollout lmbda=1 "
             f"max_length={trainer.generation_config.max_length} kd_loss_type={args.kd_loss_type} "
             f"top_k={args.top_k} ce_weight={args.cross_entropy_weight} "
@@ -2015,6 +2198,15 @@ def main():
             f"gate={args.gate_soft_threshold}/{args.gate_hard_threshold} "
             f"interval={args.gate_interval} start={args.gate_start_step}"
         )
+        if args.short_opd:
+            logger.info(
+                "ShortOPD controller: "
+                f"budget=[{args.short_opd_min_tokens},{args.short_opd_max_tokens}] "
+                f"rho={args.short_opd_rho_low}/{args.short_opd_rho_high} "
+                f"trunc={args.short_opd_truncation_threshold} "
+                f"margin={args.short_opd_margin} growth={args.short_opd_growth} "
+                f"ema={args.short_opd_stat_ema}/{args.short_opd_budget_ema}"
+            )
 
     if trainer.is_world_process_zero():
         print(trainer.model)
@@ -2038,6 +2230,14 @@ def main():
                 "--model for a weight-only warm-start instead."
             )
     if last_checkpoint is not None:
+        if args.short_opd:
+            short_state_path = Path(last_checkpoint) / "short_opd_state.json"
+            if not short_state_path.is_file():
+                raise FileNotFoundError(
+                    f"ShortOPD resume requires controller state: {short_state_path}"
+                )
+            trainer.load_short_opd_state_dict(json.loads(short_state_path.read_text()))
+            logger.info(f"Loaded ShortOPD controller state: {short_state_path}")
         logger.info(f"Resuming training from checkpoint: {last_checkpoint}")
         print(f"Resuming training from checkpoint: {last_checkpoint}")
         trainer.train(resume_from_checkpoint=last_checkpoint)

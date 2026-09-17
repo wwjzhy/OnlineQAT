@@ -1667,6 +1667,174 @@ log/eval/${FULL_TAG}/watcher.log
 
 ---
 
+## Exp #21（2026-09-17 新增）— W2-OPD stable 从 step 85 续训 65 step
+
+**目标：** 从 `#15` 的 stable55 Trainer `checkpoint-85` 真续训到 global
+step 150，即额外训练 65 个 optimizer steps。检验 stable 分支在 80–85 附近达到
+平台后，继续保持 `lr=2e-6` 是继续恢复、震荡，还是过拟合/退化。本实验不改
+loss、数据、batch、量化配置或 LR，只增加训练长度。
+
+**固定配置：** W2A16、sampled reverse-KL OPD、CE=0、effective batch 64、
+`max_length=8192`、8 GPU；step 85–150 保持 `lr=2e-6`。必须加载 Trainer
+checkpoint，保留模型、Adam、scheduler 和 RNG；不能用
+`output/distill/.../checkpoint-85` 权重热启动。
+
+**依赖：**
+
+```
+log/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-85
+```
+
+**状态：** 未跑。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+SRC=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold
+RUN21=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-stable-cont85to150
+test -f "log/distill/${SRC}/checkpoint-85/trainer_state.json"
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 150 --save-steps 5 \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --resume-from "log/distill/${SRC}/checkpoint-85" \
+  --run-suffix stable-cont85to150
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${RUN21}" \
+  --wbits 2 --eval-gpu 0 \
+  --steps 90,95,100,105,110,115,120,125,130,135,140,145,150 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${RUN21}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${RUN21}" \
+  --out-dir "output/plots/${RUN21}"
+```
+
+**开训闸门：** 第一条新日志必须是 global step 86 附近，LR 始终约
+`2e-6`；若从 step 0 重启、Adam 被重置或 LR 重新 warmup，立即停止。本实验
+只用 GSM8K/MATH-500 筛选趋势；选出最佳点后再补完整 8 项 benchmark。
+
+**必报：** 每 5 step 的 GSM8K/MATH-500，以及 LR、loss、grad norm、code
+jump、response length、EOS/truncation；同时报告 step 85→150 的总墙钟。主对照
+是 `#20` 的 stable checkpoint 80/85。
+
+产出：
+
+```
+log/distill/${RUN21}/checkpoint-{90,95,...,150}
+output/distill/${RUN21}/checkpoint-{90,95,...,150}
+output/eval/${RUN21}/checkpoint-{90,95,...,150}
+output/plots/${RUN21}/opd_timeline.{csv,jsonl}
+```
+
+---
+
+## Exp #22（2026-09-17 新增）— W2 ShortOPD-inspired 自适应 rollout，Stage 1 起训 100 step
+
+**目标：** 从 `#4` 的 W2 Stage 1 权重重新训练 100 step，把
+[ShortOPD](https://arxiv.org/abs/2607.13124) 的“重复检测 + 截断感知 +
+short-to-long rollout budget”移植到当前量化 OPD，检验 W2 的早期长 rollout
+是否在重复后缀上浪费计算并产生低价值更新。
+
+这不是 ShortOPD 论文的严格复现。论文使用 top-100+tail generalized JSD 和
+teacher-loss 边界细化；本实验为了和 `#15` 做单变量比较，继续使用当前的
+**sampled reverse-KL OPD**，只改变 rollout horizon。检测到的重复 token 仍参与
+OPD loss，检测器只控制下一 step 的生成预算。
+
+**与 `#15` 对齐的配置：** W2A16、同一 Stage 1、teacher、OpenThoughts 数据、
+effective batch 64、8 GPU、CE=0、`T=0.6`、总长上限 8192；LR 为前 30 step
+`2e-7→2e-6`，之后 hold `2e-6`，总计 100 step。唯一实验变量是 response
+budget (H_t)。
+
+**ShortOPD controller：**
+
+| 项 | 配置 |
+|--|--|
+| 初始/最大 budget | `8192` response tokens；实际每批为 `min(H_t, 8192 - padded_prompt_len)` |
+| 最小 budget | `1024` |
+| terminal loop | 最后 512 token，period 1–10，末端 32 token agreement ≥0.9 |
+| severe loop | tail ≥128 token，或占 suffix ≥30%；至少 3 cycles、tail ≥64 |
+| repetition gate | `rho_low=0.20`, `rho_high=0.45` |
+| clean truncation gate | `tau=0.10` |
+| effective-length margin / growth | `1.15 / 1.25` |
+| statistic EMA / budget EMA | `0.7 / 0.7` |
+| budget rounding | 16-token 倍数 |
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`。
+
+**状态：** 未跑。当前实现是 ShortOPD 的 token-only structural detector；未实现
+论文里的 OPD-loss/teacher-NLL onset refinement，结果中统一写
+`ShortOPD-inspired`，不能写“复现 ShortOPD”。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+RUN22=Qwen3-1.7B-w2g128-shortopd-lr2e-6-wu30-ws2e-7-schhold-short2long100
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-steps 100 --save-steps 5 \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --short-opd \
+  --short-opd-min 1024 \
+  --short-opd-max 8192 \
+  --run-suffix short2long100
+
+KEEP_CHECKPOINTS=1 \
+EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${RUN22}" \
+  --wbits 2 --eval-gpu 0 \
+  --steps 5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100 \
+  --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${RUN22}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${RUN22}" \
+  --out-dir "output/plots/${RUN22}"
+```
+
+**开训闸门：** 横幅必须显示 `mode=short-opd`、budget `1024..8192`；
+`opd_step_metrics.jsonl` 每 step 必须包含：
+
+- `opd/shortopd_budget`、`opd/shortopd_batch_budget`
+- `opd/shortopd_repetition_rate`
+- `opd/shortopd_clean_truncation_rate`
+- `opd/shortopd_effective_length`
+
+每个 Trainer checkpoint 还必须包含 `short_opd_state.json`，否则不能安全 resume。
+
+**判断有效：** 与 `#15` 同 step 比较，不只看最终分数。至少同时报告
+GSM8K/MATH-500、paper-5/full-suite 最佳点、累计 rollout tokens、训练墙钟、
+repetition rate、budget 轨迹、EOS/truncation、grad norm 和 code jump。方法只有在
+精度不降或提升的同时明显降低 rollout tokens/墙钟，或者以相同成本更快达到
+`#15` 的分数，才算有效。若有信号，再补 fixed-H 对照以拆分“动态 controller”
+与“单纯缩短 horizon”。
+
+产出：
+
+```
+log/distill/${RUN22}/checkpoint-{5,10,...,100}
+output/distill/${RUN22}/checkpoint-{5,10,...,100}
+output/eval/${RUN22}/checkpoint-{5,10,...,100}
+output/plots/${RUN22}/opd_timeline.{csv,jsonl}
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：

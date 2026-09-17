@@ -36,6 +36,9 @@ RESUME=0
 RESUME_FROM=""
 INIT_FROM=""
 RUN_SUFFIX=""
+SHORT_OPD=0
+SHORT_OPD_MIN_TOKENS="1024"
+SHORT_OPD_MAX_TOKENS="8192"
 MIXED_OPD=0
 ONLINE_RATIO="0.25"
 GATE_SOFT="0.05"
@@ -92,6 +95,9 @@ Options:
   --resume-from PATH     Resume from an explicit Trainer checkpoint directory
   --init-from PATH       Weight-only warm-start (eval snapshot / distill dir); not true resume
   --run-suffix STR       Append -<STR> to distill tag (e.g. cont50) to avoid overwriting
+  --short-opd            Repetition-gated adaptive rollout budget (ShortOPD-inspired)
+  --short-opd-min N      Minimum response budget (default: 1024)
+  --short-opd-max N      Maximum response budget (default: 8192)
   --mixed-opd            Offline top-k FKL + online sampled RKL, code-jump gated
   --online-ratio R       Initial/fixed online-step ratio (default: 0.25)
   --gate-soft R          Raise online ratio below this jump EMA (default: 0.05)
@@ -147,6 +153,9 @@ while [[ $# -gt 0 ]]; do
     --resume-from) RESUME_FROM="$2"; RESUME=1; shift 2 ;;
     --init-from) INIT_FROM="$2"; shift 2 ;;
     --run-suffix) RUN_SUFFIX="$2"; shift 2 ;;
+    --short-opd) SHORT_OPD=1; shift ;;
+    --short-opd-min) SHORT_OPD_MIN_TOKENS="$2"; shift 2 ;;
+    --short-opd-max) SHORT_OPD_MAX_TOKENS="$2"; shift 2 ;;
     --mixed-opd) MIXED_OPD=1; shift ;;
     --online-ratio) ONLINE_RATIO="$2"; shift 2 ;;
     --gate-soft) GATE_SOFT="$2"; shift 2 ;;
@@ -169,6 +178,10 @@ if [[ "${WBITS}" != "2" && "${WBITS}" != "3" ]]; then
 fi
 if [[ "${STAGE}" != "all" && "${STAGE}" != "2" && "${STAGE}" != "3" ]]; then
   echo "OPD script --stage must be all|2|3 (Stage 1 is scripts/run_qwen3_1.7b.sh), got ${STAGE}" >&2
+  exit 1
+fi
+if [[ "${SHORT_OPD}" -eq 1 && "${MIXED_OPD}" -eq 1 ]]; then
+  echo "--short-opd and --mixed-opd are mutually exclusive" >&2
   exit 1
 fi
 if [[ ! -f "${MODEL}/config.json" ]]; then
@@ -194,7 +207,9 @@ fi
 
 EXP_NAME="Qwen3-1.7B-w${WBITS}g${GROUP_SIZE}"
 DISTILL_TAG="${EXP_NAME}-opd"
-if [[ "${MIXED_OPD}" -eq 1 ]]; then
+if [[ "${SHORT_OPD}" -eq 1 ]]; then
+  DISTILL_TAG="${EXP_NAME}-shortopd"
+elif [[ "${MIXED_OPD}" -eq 1 ]]; then
   DISTILL_TAG="${EXP_NAME}-mixedopd"
 fi
 if [[ "${TRAIN_EMB}" -eq 1 ]]; then
@@ -323,7 +338,13 @@ elif [[ "${RESUME}" -eq 1 ]]; then
 fi
 
 OPD_FLAGS=(--opd)
-if [[ "${MIXED_OPD}" -eq 1 ]]; then
+if [[ "${SHORT_OPD}" -eq 1 ]]; then
+  OPD_FLAGS=(
+    --short_opd
+    --short_opd_min_tokens "${SHORT_OPD_MIN_TOKENS}"
+    --short_opd_max_tokens "${SHORT_OPD_MAX_TOKENS}"
+  )
+elif [[ "${MIXED_OPD}" -eq 1 ]]; then
   OPD_FLAGS=(
     --mixed_opd
     --kd_loss_type forward_kl
@@ -359,7 +380,11 @@ echo "  model=${MODEL}"
 echo "  teacher=${TEACHER}"
 echo "  python=${PY}"
 echo "Stage 2 GPUs: ${DISTILL_GPUS}  (${N_DISTILL_GPUS} GPU, accum=${GRAD_ACCUM}, effective_batch=${EFFECTIVE_BATCH}, max_length=${MAX_LENGTH})"
-echo "  mode=$([[ "${MIXED_OPD}" -eq 1 ]] && echo mixed-opd || echo opd)  no CE"
+if [[ "${SHORT_OPD}" -eq 1 ]]; then
+  echo "  mode=short-opd  response_budget=${SHORT_OPD_MIN_TOKENS}..${SHORT_OPD_MAX_TOKENS}  no CE"
+else
+  echo "  mode=$([[ "${MIXED_OPD}" -eq 1 ]] && echo mixed-opd || echo opd)  no CE"
+fi
 if [[ "${MIXED_OPD}" -eq 1 ]]; then
   echo "  offline=top${TOP_K}-FKL online=sampled-RKL ratio=${ONLINE_RATIO} gate=${GATE_SOFT}/${GATE_HARD} interval=${GATE_INTERVAL} start=${GATE_START_STEP}"
 fi
