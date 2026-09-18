@@ -1835,6 +1835,154 @@ output/plots/${RUN22}/opd_timeline.{csv,jsonl}
 
 ---
 
+## Exp #23（2026-09-18 新增）— Stage 1 → OPD 目标迁移与 W2 量化平台诊断
+
+**目标：** 不重训，只复用已有 W2 Stage 1 和 `#10/#15` checkpoint，判断
+OPD 前 30 step 的分数先降后升主要来自：
+
+1. Stage 1 reconstruction 与 Stage 2 OPD 的目标冲突；
+2. master weight 尚未跨过足够多 W2 量化边界形成的离散平台；
+3. on-policy 数据分布变化，而不是固定目标本身改善。
+
+本实验区分“目标迁移”和“局部最优”。若 Stage 1 起点的 fixed-OPD gradient
+明显非零，就不能写成“陷入 Stage 2 局部最优”。
+
+### Checkpoint
+
+固定分析 13 个点：
+
+```text
+0, 5, 10, 15, 20, 25, 30, 35, 40, 50, 60, 80, 85
+```
+
+| step | 来源 |
+|---:|---|
+| 0 | `output/block_qat/Qwen3-1.7B-w2g128` |
+| 5–30 | `output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-*` |
+| 35–85 | `output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-*` |
+
+step 0–40 是主分析区间；50/60/80/85 只确认后期是否稳定。不要混入
+ShortOPD checkpoint，也不要用 `#21` 的长续训回答 warmup 机制。
+
+### 固定诊断数据
+
+**Stage 1 原生 probe：** 使用原 Stage 1 的 `sweep_0.8` validation split，
+`seed=2`、`val_size=64`、`sequence_length=2048`。所有 checkpoint 使用完全相同
+的 token、mask 和 FP teacher activation。
+
+**Common probe：** 对 `open-thoughts/OpenThoughts3-1.2M` 复现 Stage 2 的
+`shuffle(seed=2)`，跳过已经用于训练的前 32768 条，取 index
+`32768:32896` 共 128 个 prompt；按训练口径过滤 tokenized prompt length
+`>=8192`。保存最终样本 ID/原始 index，所有 checkpoint 复用同一集合。
+
+在 common probe 上只生成一次并缓存两套固定轨迹：
+
+- Probe-A：由 W2 Stage 1 模型生成；
+- Probe-B：由 warmup `checkpoint-30` 生成。
+
+两套生成都使用当前 OPD 的 chat template、`T=0.6` 和总长度上限 8192。缓存
+prompt tokens、response tokens、response mask；后续评估 checkpoint 时禁止重新
+rollout。teacher、tokenizer 和 loss mask 必须固定。
+
+### 必报指标
+
+1. **Stage 1 block-mean reconstruction loss**：在每个 Transformer block 输出
+   边界计算 quantized student 与 BF16 teacher 的 hidden-state MSE，再对 block
+   等权平均。分别在 `sweep` 和 common probe 上报告。
+2. **Stage 1 last-output loss**：完整 teacher/student 端到端前向后，在最后一个
+   Transformer block 输出、final RMSNorm 之前计算有效 token 的 hidden-state
+   MSE：
+
+   \[
+   L_{\mathrm{S1,last}}=
+   \frac{\sum_{b,t}m_{b,t}\lVert h^{(L)}_{S,b,t}-h^{(L)}_{T,b,t}\rVert_2^2}
+        {D\sum_{b,t}m_{b,t}}.
+   \]
+
+   同时报 raw MSE 和除以 teacher hidden-state 能量的 relative MSE；主表使用
+   common probe，附表报告 `sweep`。它不是 logits loss，也不是 OPD loss。
+3. **Fixed Stage 2 loss**：在 Probe-A/Probe-B 固定 token 上，按当前训练实现计算
+   response-token-only sampled reverse-KL surrogate，得到 `fixed_opd_A/B`。禁止
+   用每个 checkpoint 自己的新 rollout 横向比较。
+4. **量化状态**：相对 Stage 1 起点的 master-weight relative change、累计
+   quantized-code flip rate；相邻 checkpoint 的 code jump 和 code-jump
+   amplification。累计 code flip 定义为：
+
+   \[
+   C_t=\frac{1}{N}\sum_i \mathbf 1[q_i(\theta_t)\ne q_i(\theta_0)].
+   \]
+
+5. **已有行为结果**：直接复用相同 checkpoint 已完成的 GSM8K、MATH-500，
+   报 `Average=(GSM8K+MATH-500)/2`。不要重跑完整 benchmark；70/75/80/85 的
+   full-suite 仅作补充。
+
+所有 loss 除全局 token mean 外，还要保留 sample mean/标准误。不同目标的绝对
+尺度不可直接比较，额外报告相对 step 0 的归一化变化：
+
+\[
+\Delta L_j(t)=\frac{L_j(\theta_t)-L_j(\theta_0)}
+{|L_j(\theta_0)|+\epsilon}.
+\]
+
+### 主结果表
+
+| step | S1 block mean | S1 last output | fixed OPD-A | fixed OPD-B | master change | cumulative code flip | GSM8K | MATH-500 | Average |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | | | | | 0 | 0 | | | |
+| 5 | | | | | | | | | |
+| 10 | | | | | | | | | |
+| 15 | | | | | | | | | |
+| 20 | | | | | | | | | |
+| 25 | | | | | | | | | |
+| 30 | | | | | | | | | |
+| 35 | | | | | | | | | |
+| 40 | | | | | | | | | |
+| 50 | | | | | | | | | |
+| 60 | | | | | | | | | |
+| 80 | | | | | | | | | |
+| 85 | | | | | | | | | |
+
+主表填写 common-probe loss；`sweep` 的 block-mean/last-output loss 和逐层结果
+放附表。至少绘制：
+
+1. `S1 block mean / S1 last output / fixed OPD-A/B` 对 step；
+2. `master change / cumulative code flip` 对 step；
+3. `cumulative code flip / GSM8K / MATH-500` 的时间对齐图。
+
+### 可选梯度诊断
+
+只有 loss 曲线显示冲突时，才在 step `0/15/30/40/80` 补算
+`||g_S1||`、`||g_OPD||` 和 gradient cosine；按 layer 累计 dot product，不保存
+整模型双份梯度。
+
+### 判定规则
+
+- `S1 common loss ↑` 且 `fixed OPD loss ↓`：支持目标冲突；若 last-output 同时
+  上升，说明冲突已经传到最终 hidden state。
+- block-mean 基本不变而 last-output 上升：平均局部误差掩盖了末端累计误差。
+- block-mean 上升但 last-output 不升：更像内部表示重组，不能声称 Stage 1
+  能力被破坏。
+- master weight 先变化、累计 code flip 后出现，随后 fixed OPD loss/benchmark
+  才改善：支持 W2 量化平台。
+- 两种 Stage 1 loss 与 fixed OPD loss 同时下降：不支持目标冲突，warmup 更可能
+  主要控制优化噪声和量化码翻转。
+- fixed OPD loss 下降但 benchmark 不恢复：token-level 拟合改善尚未转化为推理
+  能力。
+
+**状态：** 待做离线统计；不启动 Stage 1/Stage 2，不重新生成每个 checkpoint
+的 rollout，不重新跑 GSM8K/MATH-500。
+
+产出：
+
+```text
+output/analysis/exp23_stage_transition/probe_manifest.json
+output/analysis/exp23_stage_transition/checkpoint_metrics.{csv,jsonl}
+output/analysis/exp23_stage_transition/layer_metrics.csv
+output/analysis/exp23_stage_transition/*.png
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
