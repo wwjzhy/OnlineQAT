@@ -1983,6 +1983,198 @@ output/analysis/exp23_stage_transition/*.png
 
 ---
 
+## Exp #24（2026-09-21 新增）— W2 PV-OPD RawGate：warm30 + stable70
+
+**目标：** 从 Exp #4 的 W2 Stage 1 权重重新起训，在与 Vanilla OPD 相同的
+`30 step warmup + 70 step hold` 日程下，验证不做 batch 均值归一化的
+token-level precision gate。不要复用 `#10 checkpoint-30`：Gate 从 step 1
+开始改变梯度，复用 Vanilla warmup 只能回答 tail-only 问题。
+
+W2 Student 负责 rollout；冻结的 BF16 Teacher 和共享当前 master weights、
+group size、实数 clipping range 的 W4 Probe 在相同 W2 history 上打分：
+
+\[
+A_t^{FP}=\log p_T(a_t\mid h_t^2)-\log p_2(a_t\mid h_t^2),\qquad
+A_t^{Prec}=\log p_4(a_t\mid h_t^2)-\log p_2(a_t\mid h_t^2).
+\]
+
+使用原始 Gate，不做 per-batch 或 fixed-warmup normalization：
+
+\[
+g_t=\mathbf 1[A_t^{FP}A_t^{Prec}>0]
+\min\left(1,\frac{|A_t^{Prec}|}{|A_t^{FP}|+\varepsilon}\right),
+\qquad g_t\in[0,1].
+\]
+
+目标函数为：
+
+\[
+L_{PV}=\frac1N\sum_t
+\operatorname{sg}\!\left[g_t\operatorname{clip}(-A_t^{FP},-c,c)\right]
+\log p_2(a_t\mid h_t^2).
+\]
+
+`c` 继续由前 10 optimizer steps 的 `|A_FP|` P99 标定；本实验只取消 Gate
+normalization，不同时移除 advantage clipping、增加 gate floor 或改变 loss。
+CE=0，W4 Probe 只验证信号且全程 `no_grad`。更新 W2 master weights、非量化
+权重和 quantizer scale；冻结 zero point、embedding、Teacher 和 Probe。
+
+### 固定设置
+
+| 项 | 设置 |
+|---|---|
+| 初始化 | `output/block_qat/Qwen3-1.7B-w2g128`（Exp #4 Stage 1） |
+| 数据 | OpenThoughts requested 32768，`seed=2`，自动 prompt-only 预过滤 |
+| 长度 | `max_length=8192`，`min_rollout_tokens=1` |
+| 量化 | W2 target / shared-range W4 probe / group size 128 |
+| Batch | 8 GPU，per-device 1，effective batch 64 |
+| LR | step 0 为 `2e-7`，30 steps 升到 `2e-6` |
+| Stable | step 31–100 使用 `constant_with_warmup` hold `2e-6` |
+| Loss | RawGate × clipped sampled reverse-KL，CE=0，temperature=0.6 |
+| 保存 | 每 5 optimizer steps |
+| 评测 | 只评 GSM8K、MATH-500 |
+
+启动前必须看到 prompt filter 的 `before/after/filtered/max_before/max_after`，且
+`max_after<=8191`。正式对照必须是使用相同修复后数据口径的 Vanilla
+`warm30 + stable70`；基于错误 2124 条样本的数据轨迹不能作为正式结果。
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`。不依赖任何
+Vanilla OPD Trainer checkpoint。
+
+**状态：** RawGate 代码与启动参数已加入；token-level 记录协议已确定但代码尚未
+实现。完成下面的记录与 1-step smoke 前不要启动正式 GPU 训练；当前尚无结果。
+
+### Token-level 诊断记录（正式开跑前的硬要求）
+
+记录所有 rank、所有 gradient-accumulation micro-batch 中的**有效 rollout
+response token**；位置从每条 response 的 0 开始。prompt、padding 和 EOS 后区域
+不记入。诊断张量全部 `detach`，只用于离线分析，不参与 loss，也不得改变训练
+轨迹。
+
+每个 token 至少保存：
+
+```text
+step, sample_id, response_pos, token_id,
+student_logp, teacher_logp, probe_logp,
+A_fp, A_prec, same_direction, gate, clipped_advantage, is_eos
+```
+
+每条 trajectory 额外保存 `prompt_length`、生成 token ids、`response_length`、
+`hit_max_length`、`repeated_suffix`，以及在可可靠自动判分时的 `is_correct`；不能
+可靠判分的 OpenThoughts 样本保留为空，不能用 Teacher 分数冒充正确性。按
+optimizer step 写紧凑 `.pt`，训练后再合并：
+
+```text
+log/distill/<tag>/pv_token_traces/step-<step>-rank-<rank>.pt
+```
+
+不保存完整 vocabulary logits。若选定少量异常 checkpoint 后确实需要候选分布，
+再对这些 checkpoint 单独补 top-k logits。1-step smoke 必须确认 8 个 rank 文件均
+存在、每个 `response_pos` 从 0 连续递增，且所有文件的有效 token 数之和等于训练
+日志中的有效 response token 数。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+test -f output/block_qat/Qwen3-1.7B-w2g128/config.json
+
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=. python tests/test_pv_opd.py
+bash -n scripts/run_qwen3_1.7b_pv_opd.sh
+
+bash scripts/run_qwen3_1.7b_pv_opd.sh \
+  --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --probe-bits 4 \
+  --gate-mode full \
+  --gate-normalization none \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --max-steps 100 \
+  --save-steps 5
+
+TAG=Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
+
+KEEP_CHECKPOINTS=1 EVAL_DATASETS="gsm8k math_500" \
+  bash scripts/eval_distill_checkpoints.sh \
+  --watch-dir "output/distill/${TAG}" \
+  --wbits 2 --eval-gpu 0 \
+  --steps 5,10,15,20,25,30,35,50,75,100 --skip-final
+
+python scripts/merge_opd_timeline.py \
+  --metrics "log/distill/${TAG}/opd_step_metrics.jsonl" \
+  --eval-root "output/eval/${TAG}" \
+  --out-dir "output/plots/${TAG}"
+
+# 转换 final 时必须重复影响 TAG 的参数。
+bash scripts/run_qwen3_1.7b_pv_opd.sh \
+  --stage 3 \
+  --gate-normalization none \
+  --lr 2e-6 \
+  --warmup-steps 30 \
+  --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup
+```
+
+训练启动后先检查：
+
+1. 横幅包含 `gate=full normalization=none`、`lr=2e-6`、
+   `warmup_steps=30`、`scheduler=constant_with_warmup`。
+2. `pv/gate_mean` 是 RawGate 的实际均值，不应被强制到约 1；
+   `pv/gate_keep_rate`、`pv/same_direction_rate`、`pv/adv_clip` 正常落盘。
+3. step 30 的 LR 达到约 `2e-6`，step 35/50/75/100 保持约 `2e-6`。
+4. `opd_step_metrics.jsonl`、`opd_timing_summary.json`、timeline 与训练墙钟按
+   文末结果清单报告；不要只报最终分数。
+
+### 预期结果与判断路径
+
+本实验的首要预期不是保证最终分数上涨，而是验证 W4 Probe 能否在 W2 rollout
+上识别可信的 Teacher 修正方向。RawGate 未归一化，故 `gate_mean` 应自然低于
+batch-normalized 版本；同 LR 下有效更新通常更小。若假设成立，预期表现为：
+
+1. warmup 初期可能比 Vanilla 涨得慢，但 code jump、重复后缀和 response 顶满率
+   更低；stable 段继续提升，而不是在少数 checkpoint 偶然冲高。
+2. 同方向且 Gate 较高的 token 更集中在非重复、正常 EOS 的 trajectory；在能自动
+   判分的样本上，它们应更偏向正确 trajectory。这里只能证明相关性，不能直接
+   声称这些 token 具有因果贡献。
+3. 主结果看 step 35/50/75/100 的
+   `(GSM8K + MATH-500) / 2` 曲线面积与 final，不以单个 best checkpoint 下结论。
+   暂定成功线：相对 clean Vanilla 至少连续两个 checkpoint 的平均分提高
+   `>=1.0`，且 final 不退化；同时没有以明显更长 response 或更高顶满率换分。
+
+训练结束后先按 `response_pos` 统计 `same_direction_rate`、`gate_mean`、
+`|A_fp|`、`|A_prec|`，再分别按正确/错误、重复/非重复、EOS/顶满 trajectory
+分组。随后只走一个分支：
+
+| 观察 | 下一步 |
+|---|---|
+| 分数稳定提升，且高 Gate 与正常/正确轨迹相关 | 跑 batch-normalized PV 对照，再做 shuffled-gate，确认收益不是单纯缩小梯度 |
+| 训练更稳但分数不涨，`gate_mean` 很小 | 保持 Gate 排序，只做等均值 rescale 对照；不要同时改 `c` |
+| 高 Gate 与正确性无关，shuffled-gate 也相当 | Gate 没提供 precision 信息，停止扩展该方向 |
+| `same_direction_rate` 很低，W4 经常与 Teacher 反向 | W4 Probe 不够可靠；下一次只比较更高 probe bit 或独立校准，不继续调 Gate 公式 |
+| 重复/顶满集中在后段且对应异常 Gate | 再做 position/repetition mask 消融；先不加入主实验 |
+
+“哪些 token 有用”的最终结论必须由后续 token-mask 或 shuffled-gate 消融验证；
+本实验的 token-level 统计只负责提出候选规律。
+
+主比较使用相同 step 的 GSM8K/MATH-500、grad norm、code jump、Gate 均值和
+rollout 时间。若 RawGate 训练稳定且优于 clean Vanilla，再补完全相同 schedule
+的 batch-normalized PV 消融；本实验不预先支付第二条 PV 训练成本。
+
+产出：
+
+```text
+output/distill/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
+output/eval/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
+log/distill/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
+log/distill/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold/pv_token_traces
+output/plots/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
+```
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：

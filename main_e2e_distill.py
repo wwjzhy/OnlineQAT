@@ -225,6 +225,7 @@ class PolicyGKDTrainer(GKDTrainer):
         pv_opd_mode=False,
         pv_probe_bits=4,
         pv_gate_mode="full",
+        pv_gate_normalization="batch",
         pv_gate_max=2.0,
         pv_adv_clip=0.0,
         pv_adv_clip_warmup_steps=10,
@@ -276,6 +277,7 @@ class PolicyGKDTrainer(GKDTrainer):
         self.pv_opd_mode = pv_opd_mode
         self.pv_probe_bits = pv_probe_bits
         self.pv_gate_mode = pv_gate_mode
+        self.pv_gate_normalization = pv_gate_normalization
         self.pv_gate_max = pv_gate_max
         self.pv_adv_clip = pv_adv_clip
         self.pv_adv_clip_warmup_steps = pv_adv_clip_warmup_steps
@@ -495,12 +497,17 @@ class PolicyGKDTrainer(GKDTrainer):
         a_prec,
         valid_mask,
         gate_mode="full",
+        gate_normalization="batch",
         gate_max=2.0,
         eps=1e-6,
     ):
-        """Build the detached PV gate and normalize its valid-token mean."""
+        """Build the detached PV gate, optionally normalizing its token mean."""
         if gate_mode not in {"full", "sign", "shuffled"}:
             raise ValueError(f"unsupported PV gate mode: {gate_mode}")
+        if gate_normalization not in {"batch", "none"}:
+            raise ValueError(
+                f"unsupported PV gate normalization: {gate_normalization}"
+            )
         same_direction = (a_fp * a_prec) > 0
         gate = same_direction.to(torch.float32)
         if gate_mode in {"full", "shuffled"}:
@@ -508,14 +515,15 @@ class PolicyGKDTrainer(GKDTrainer):
             gate = gate * recovery
         gate = gate * valid_mask
 
-        gate_sum = gate.sum()
-        gate_count = valid_mask.sum().to(gate.dtype)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            stats = torch.stack([gate_sum, gate_count])
-            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
-            gate_sum, gate_count = stats[0], stats[1]
-        gate_mean = gate_sum / gate_count.clamp_min(1.0)
-        gate = (gate / (gate_mean + eps)).clamp(max=gate_max) * valid_mask
+        if gate_normalization == "batch":
+            gate_sum = gate.sum()
+            gate_count = valid_mask.sum().to(gate.dtype)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                stats = torch.stack([gate_sum, gate_count])
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+                gate_sum, gate_count = stats[0], stats[1]
+            gate_mean = gate_sum / gate_count.clamp_min(1.0)
+            gate = (gate / (gate_mean + eps)).clamp(max=gate_max) * valid_mask
 
         if gate_mode == "shuffled":
             shuffled = gate[valid_mask]
@@ -622,6 +630,7 @@ class PolicyGKDTrainer(GKDTrainer):
                 a_prec,
                 valid_mask,
                 gate_mode=self.pv_gate_mode,
+                gate_normalization=self.pv_gate_normalization,
                 gate_max=self.pv_gate_max,
             )
             adv_clip = self._update_pv_adv_clip(a_fp, valid_mask)
@@ -1756,6 +1765,7 @@ def main():
     parser.add_argument("--pv_opd", action="store_true", help="PV-OPD FullPair: gate sampled reverse-KL with a shared-range precision probe.")
     parser.add_argument("--pv_probe_bits", type=int, default=4, help="Precision-probe bitwidth for PV-OPD.")
     parser.add_argument("--pv_gate_mode", choices=["full", "sign", "shuffled"], default="full", help="PV gate or gate ablation.")
+    parser.add_argument("--pv_gate_normalization", choices=["batch", "none"], default="batch", help="PV gate normalization; 'none' keeps the raw [0,1] confidence.")
     parser.add_argument("--pv_gate_max", type=float, default=2.0, help="Maximum normalized PV gate.")
     parser.add_argument("--pv_adv_clip", type=float, default=0.0, help="Fixed |A_FP| clip; 0 calibrates from warmup P99.")
     parser.add_argument("--pv_adv_clip_warmup_steps", type=int, default=10, help="Steps used to calibrate |A_FP| P99.")
@@ -2156,6 +2166,7 @@ def main():
         pv_opd_mode=args.pv_opd,
         pv_probe_bits=args.pv_probe_bits,
         pv_gate_mode=args.pv_gate_mode,
+        pv_gate_normalization=args.pv_gate_normalization,
         pv_gate_max=args.pv_gate_max,
         pv_adv_clip=args.pv_adv_clip,
         pv_adv_clip_warmup_steps=args.pv_adv_clip_warmup_steps,
@@ -2194,6 +2205,7 @@ def main():
             f"max_length={trainer.generation_config.max_length} kd_loss_type={args.kd_loss_type} "
             f"top_k={args.top_k} ce_weight={args.cross_entropy_weight} "
             f"probe_bits={args.pv_probe_bits if args.pv_opd else 'none'} "
+            f"pv_gate_normalization={args.pv_gate_normalization if args.pv_opd else 'none'} "
             f"online_ratio={args.online_ratio if args.mixed_opd else 1.0} "
             f"gate={args.gate_soft_threshold}/{args.gate_hard_threshold} "
             f"interval={args.gate_interval} start={args.gate_start_step}"

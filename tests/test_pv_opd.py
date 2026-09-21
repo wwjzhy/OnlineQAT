@@ -70,6 +70,21 @@ def test_gate_drops_opposite_direction_tokens():
     assert float(gate.max()) <= 2.0
 
 
+def test_raw_gate_matches_formula_without_normalization():
+    a_fp = torch.tensor([[1.0, 2.0, -2.0, -2.0]])
+    a_prec = torch.tensor([[0.5, 0.5, -1.0, 1.0]])
+    mask = torch.ones_like(a_fp, dtype=torch.bool)
+    gate, same = PolicyGKDTrainer.build_precision_gate(
+        a_fp,
+        a_prec,
+        mask,
+        gate_mode="full",
+        gate_normalization="none",
+    )
+    assert same.tolist() == [[True, True, True, False]]
+    assert torch.allclose(gate, torch.tensor([[0.5, 0.25, 0.5, 0.0]]))
+
+
 def test_chunked_fp32_action_logp_matches_reference():
     torch.manual_seed(2)
     logits = torch.randn(2, 4, 37, dtype=torch.bfloat16, requires_grad=True)
@@ -107,6 +122,7 @@ def test_sign_and_shuffled_gate_preserve_support_size():
 def _bare_pv_trainer():
     trainer = PolicyGKDTrainer.__new__(PolicyGKDTrainer)
     trainer.pv_gate_mode = "full"
+    trainer.pv_gate_normalization = "batch"
     trainer.pv_gate_max = 2.0
     trainer.pv_adv_clip = 2.0
     trainer.pv_adv_clip_warmup_steps = 0
@@ -226,6 +242,10 @@ def test_pv_script_is_isolated_and_has_expected_defaults():
     assert 'PROBE_BITS="${PV_PROBE_BITS:-4}"' in script
     assert 'MAX_STEPS="${MAX_STEPS:-100}"' in script
     assert 'SAVE_STEPS="${SAVE_STEPS:-5}"' in script
+    assert "--pv_gate_normalization" in script
+    assert "--gate-normalization" in script
+    assert "--warmup-steps" in script
+    assert "--lr-scheduler" in script
     assert "-pv-opd" in script
     assert "--enable_efficient_qat" not in script
     assert "--train_emb" not in script
@@ -236,6 +256,7 @@ if __name__ == "__main__":
         test_w2_w4_probe_shares_real_clipping_range,
         test_precision_view_restores_target_bits_and_cache,
         test_gate_drops_opposite_direction_tokens,
+        test_raw_gate_matches_formula_without_normalization,
         test_chunked_fp32_action_logp_matches_reference,
         test_sign_and_shuffled_gate_preserve_support_size,
         test_full_pair_receives_weight_and_scale_gradients,

@@ -16,6 +16,12 @@ DISTILL_GPUS="${DISTILL_GPUS:-0,1,2,3,4,5,6,7}"
 MAX_STEPS="${MAX_STEPS:-100}"
 SAVE_STEPS="${SAVE_STEPS:-5}"
 GATE_MODE="${PV_GATE_MODE:-full}"
+GATE_NORMALIZATION="${PV_GATE_NORMALIZATION:-batch}"
+DISTILL_LR="${DISTILL_LR:-5e-6}"
+WARMUP_STEPS=""
+WARMUP_START_LR=""
+LR_SCHEDULER=""
+RUN_SUFFIX=""
 MAX_LENGTH="${MAX_LENGTH:-8192}"
 DATASET_SIZE="${DATASET_SIZE:-32768}"
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-1}"
@@ -41,6 +47,12 @@ Options:
   --max-steps N          Optimizer-step cap (default: 100)
   --save-steps N         Snapshot interval (default: 5)
   --gate-mode MODE       full|sign|shuffled (default: full)
+  --gate-normalization N batch|none (default: batch)
+  --lr RATE              Stage 2 peak learning rate (default: 5e-6)
+  --warmup-steps N       Fixed linear warmup steps
+  --warmup-start-lr RATE Non-zero LR at warmup step 0
+  --lr-scheduler NAME    HF scheduler (e.g. constant_with_warmup)
+  --run-suffix STR       Append a unique output suffix
   --max-length N         Total prompt+rollout cap (default: 8192)
   --model PATH           BF16 base model path
   --teacher PATH         Frozen BF16 teacher path
@@ -60,6 +72,12 @@ while [[ $# -gt 0 ]]; do
     --max-steps) MAX_STEPS="$2"; shift 2 ;;
     --save-steps) SAVE_STEPS="$2"; shift 2 ;;
     --gate-mode) GATE_MODE="$2"; shift 2 ;;
+    --gate-normalization) GATE_NORMALIZATION="$2"; shift 2 ;;
+    --lr) DISTILL_LR="$2"; shift 2 ;;
+    --warmup-steps) WARMUP_STEPS="$2"; shift 2 ;;
+    --warmup-start-lr) WARMUP_START_LR="$2"; shift 2 ;;
+    --lr-scheduler) LR_SCHEDULER="$2"; shift 2 ;;
+    --run-suffix) RUN_SUFFIX="$2"; shift 2 ;;
     --max-length) MAX_LENGTH="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --teacher) TEACHER="$2"; shift 2 ;;
@@ -78,6 +96,10 @@ if [[ "${PROBE_BITS}" -le "${WBITS}" ]]; then
 fi
 if [[ "${GATE_MODE}" != "full" && "${GATE_MODE}" != "sign" && "${GATE_MODE}" != "shuffled" ]]; then
   echo "--gate-mode must be full|sign|shuffled" >&2
+  exit 1
+fi
+if [[ "${GATE_NORMALIZATION}" != "batch" && "${GATE_NORMALIZATION}" != "none" ]]; then
+  echo "--gate-normalization must be batch|none" >&2
   exit 1
 fi
 if [[ ! -f "${MODEL}/config.json" ]]; then
@@ -113,6 +135,27 @@ TAG="${EXP_NAME}-pv-opd"
 if [[ "${GATE_MODE}" != "full" ]]; then
   TAG="${TAG}-${GATE_MODE}"
 fi
+if [[ "${GATE_NORMALIZATION}" == "none" ]]; then
+  TAG="${TAG}-rawgate"
+fi
+if [[ "${DISTILL_LR}" != "5e-6" ]]; then
+  LR_TAG="$(printf '%s' "${DISTILL_LR}" | tr '[:upper:]' '[:lower:]' | sed 's/[.]/_/g')"
+  TAG="${TAG}-lr${LR_TAG}"
+fi
+if [[ -n "${WARMUP_STEPS}" ]]; then
+  TAG="${TAG}-wu${WARMUP_STEPS}"
+fi
+if [[ -n "${WARMUP_START_LR}" ]]; then
+  WS_TAG="$(printf '%s' "${WARMUP_START_LR}" | tr '[:upper:]' '[:lower:]' | sed 's/[.]/_/g')"
+  TAG="${TAG}-ws${WS_TAG}"
+fi
+if [[ -n "${LR_SCHEDULER}" && "${LR_SCHEDULER}" != "linear" ]]; then
+  SCH_TAG="$(printf '%s' "${LR_SCHEDULER}" | tr '[:upper:]' '[:lower:]' | tr '-' '_' | sed 's/constant_with_warmup/hold/')"
+  TAG="${TAG}-sch${SCH_TAG}"
+fi
+if [[ -n "${RUN_SUFFIX}" ]]; then
+  TAG="${TAG}-${RUN_SUFFIX}"
+fi
 BLOCK_DIR="${ROOT}/output/block_qat/${EXP_NAME}"
 DISTILL_DIR="${ROOT}/output/distill/${TAG}"
 DISTILL_LOG="${ROOT}/log/distill/${TAG}"
@@ -120,8 +163,9 @@ VLLM_DIR="${ROOT}/output/vllm/${TAG}"
 
 echo "============================================================"
 echo "PV-OPD FullPair: W${WBITS} target / W${PROBE_BITS} probe"
-echo "stage=${STAGE} gate=${GATE_MODE} GPUs=${DISTILL_GPUS}"
+echo "stage=${STAGE} gate=${GATE_MODE} normalization=${GATE_NORMALIZATION} GPUs=${DISTILL_GPUS}"
 echo "max_steps=${MAX_STEPS} save_steps=${SAVE_STEPS} max_length=${MAX_LENGTH}"
+echo "lr=${DISTILL_LR} warmup_steps=${WARMUP_STEPS:-ratio0.2} warmup_start_lr=${WARMUP_START_LR:-0} scheduler=${LR_SCHEDULER:-linear}"
 echo "effective_batch=${TARGET_BATCH} grad_accum=${GRAD_ACCUM}"
 echo "block=${BLOCK_DIR}"
 echo "distill=${DISTILL_DIR}"
@@ -134,6 +178,16 @@ if [[ "${STAGE}" == "2" ]]; then
   fi
   mkdir -p "${DISTILL_DIR}" "${DISTILL_LOG}"
   rm -f "${DISTILL_DIR}/.train_done"
+  WARMUP_FLAGS=()
+  if [[ -n "${WARMUP_STEPS}" ]]; then
+    WARMUP_FLAGS+=(--warmup_steps "${WARMUP_STEPS}")
+  fi
+  if [[ -n "${WARMUP_START_LR}" ]]; then
+    WARMUP_FLAGS+=(--warmup_start_lr "${WARMUP_START_LR}")
+  fi
+  if [[ -n "${LR_SCHEDULER}" ]]; then
+    WARMUP_FLAGS+=(--lr_scheduler_type "${LR_SCHEDULER}")
+  fi
   CUDA_VISIBLE_DEVICES="${DISTILL_GPUS}" accelerate launch \
     --config_file "${ROOT}/configs/accelerate_config_multigpu.yaml" \
     --num_processes "${N_GPUS}" \
@@ -145,12 +199,13 @@ if [[ "${STAGE}" == "2" ]]; then
     --group_size "${GROUP_SIZE}" \
     --epochs 3 \
     --max_steps "${MAX_STEPS}" \
-    --learning_rate 5e-6 \
+    --learning_rate "${DISTILL_LR}" \
     --kl_weight 1.0 \
     --cross_entropy_weight 0.0 \
     --pv_opd \
     --pv_probe_bits "${PROBE_BITS}" \
     --pv_gate_mode "${GATE_MODE}" \
+    --pv_gate_normalization "${GATE_NORMALIZATION}" \
     --pv_gate_max 2.0 \
     --pv_adv_clip_warmup_steps 10 \
     --dataset_type openthoughts \
@@ -158,6 +213,7 @@ if [[ "${STAGE}" == "2" ]]; then
     --max_length "${MAX_LENGTH}" \
     --per_device_train_batch_size "${PER_DEVICE_BATCH}" \
     --gradient_accumulation_steps "${GRAD_ACCUM}" \
+    ${WARMUP_FLAGS[@]+"${WARMUP_FLAGS[@]}"} \
     --save_steps "${SAVE_STEPS}" \
     --save_quant_dir "${DISTILL_DIR}" \
     --output_dir "${DISTILL_LOG}"
