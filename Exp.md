@@ -2175,6 +2175,92 @@ output/plots/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
 
 ---
 
+## Exp #25（2026-09-23 新增）— W2 Vanilla OPD 短上下文 / 短 rollout 消融
+
+**目标：** 从 Exp #4 的 W2 Stage 1 权重重新起训，检验把 prompt + response
+总长上限由 `8192` 缩短到 `2048`、response 上限设为 `1024` 后，能否明显降低
+rollout 成本并保留 GSM8K / MATH-500 表现。这是长度—成本消融，不是与 8192
+基线等价的训练。
+
+**保持不变：** W2A16、group size 128、同一 Stage 1、数据顺序与 seed、sampled
+reverse-KL、CE=0、temperature=0.6、8 GPU、effective batch 64。使用 stable
+日程：前 30 step 从 `2e-7` 线性 warmup 到 `2e-6`，随后 120 step 恒定保持
+`2e-6`，共 150 optimizer steps。
+
+| 项 | 8192 基线 | Exp #25 |
+|--|--:|--:|
+| prompt + response 总长上限 | 8192 | **2048** |
+| response 上限 | 剩余总长动态决定 | **1024** |
+| 每个 batch 的实际 response budget | `8192 - padded_prompt_len` | **`min(1024, 2048 - padded_prompt_len)`** |
+
+**实现约束：** 当前 Vanilla OPD 会将 `max_new_tokens=None`，只用 `max_length`
+控制总长；因此本实验启动前需要显式实现 response cap。不能简单地同时把
+`max_length=2048` 和 `max_new_tokens=1024` 交给 `generate`：
+`max_new_tokens` 可能优先生效，使总长超过 2048。代码必须逐 batch 计算上表中的
+实际 budget。
+
+prompt-only 预过滤仍只保证至少 1 个 rollout token，即 `prompt_length <= 2047`。
+因此长 prompt 能生成的 response 可能少于 1024。若要求每条样本都保留 1024-token
+response 空间，则应过滤为 `prompt_length <= 1024`，但这会额外改变 prompt 分布，
+本实验暂不采用。
+
+**必报结果：** 与 8192 基线按相同 optimizer step 对齐，报告 GSM8K、MATH-500、
+平均 response length、截断率、EOS 率、累计 rollout tokens、rollout 墙钟时间、
+sec/step 和总训练时间。若分数下降，需要区分长 prompt 被压缩、response 被 1024
+cap 截断，以及有效 loss token 减少这三种原因。
+
+**判定：** 若两项分数不明显退化，同时累计 rollout tokens 和墙钟时间明显下降，
+则支持把短 rollout 用作前期训练或自适应长度起点；否则说明 W2 OPD 仍需要长轨迹。
+
+**依赖：** Exp #4 Stage 1。训练参数尚未实现，确认前不启动 GPU 训练。
+
+**状态：** 未跑；仅完成实验设计。
+
+---
+
+## Exp #26（2026-09-23 新增）— W3 Vanilla OPD 短上下文 / 短 rollout 消融
+
+**目标：** 做 Exp #25 的 W3 对应实验，但保留 W3 自己的训练超参数。以 Exp #2
+的 W3 Vanilla OPD 为对照，只把 prompt + response 总长上限从 `8192` 改为
+`2048`，并把 response 上限设为 `1024`，检验短 rollout 在 W3 上的速度—性能
+权衡。该实验与 Exp #25 共同观察低 bit 是否比 W3 更依赖长推理轨迹。
+
+**保持不变：** W3A16、group size 128、Exp #1 的同一份 W3 Stage 1、
+OpenThoughts 顺序与 seed、sampled reverse-KL、CE=0、temperature=0.6、8 GPU、
+effective batch 64、不训练 embedding。使用 stable 日程：前 30 step 从 `1e-7`
+线性 warmup 到 W3 峰值 `1e-6`，随后 120 step 恒定保持 `1e-6`，并显式固定
+`max_steps=150`，避免 2048 预过滤改变数据集大小后连带改变 optimizer step 数。
+
+| 项 | W3 8192 基线 | Exp #26 |
+|--|--:|--:|
+| prompt + response 总长上限 | 8192 | **2048** |
+| response 上限 | 剩余总长动态决定 | **1024** |
+| 每个 batch 的实际 response budget | `8192 - padded_prompt_len` | **`min(1024, 2048 - padded_prompt_len)`** |
+| optimizer steps | 150 | **150** |
+| 最大 prompt presentations | 9600 | **9600** |
+
+**实现与过滤约束：** 与 Exp #25 相同，启动前必须显式实现逐 batch 的 response
+cap；不能直接依赖 Hugging Face 同时设置 `max_length` 和 `max_new_tokens`。
+prompt-only 过滤条件保持 `prompt_length <= 2047`，并在状态中记录
+`before / after / filtered / max_before / max_after`。150 steps 最多消费 9600 个
+prompt；若过滤后不足 9600 条就会重复采样，须报告 unique prompt 数和重复比例。
+
+**必报结果：** 与 W3 8192 基线按相同 step 比较 GSM8K、MATH-500、平均 response
+length、截断率、EOS 率、累计 rollout tokens、rollout 墙钟时间、sec/step 和
+总训练时间。同时将 Exp #25 / #26 按相同 step 对齐，比较 W2 与 W3 的性能下降和
+成本下降比例。
+
+**判定：** 若 W3 在 2048/1024 下基本保持分数，而 W2 明显退化，支持“量化容量
+越低，越依赖长轨迹或更完整的 token-level 纠正”；若 W2/W3 都保持性能，则优先
+使用短 rollout 降低 OPD 成本；若两者都退化，则主要是任务长度预算不足。
+
+**依赖：** Exp #1 W3 Stage 1，以及与 Exp #26 日程完全一致的 W3 8192 对照。
+训练参数尚未实现，确认前不启动 GPU 训练。
+
+**状态：** 未跑；仅完成实验设计。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
