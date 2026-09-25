@@ -2175,7 +2175,7 @@ output/plots/Qwen3-1.7B-w2g128-pv-opd-rawgate-lr2e-6-wu30-ws2e-7-schhold
 
 ---
 
-## Exp #25（2026-09-23 新增）— W2 Vanilla OPD 短上下文 / 短 rollout 消融
+## Exp #26（2026-09-23 新增）— W2 Vanilla OPD 短上下文 / 短 rollout 消融
 
 **目标：** 从 Exp #4 的 W2 Stage 1 权重重新起训，检验把 prompt + response
 总长上限由 `8192` 缩短到 `2048`、response 上限设为 `1024` 后，能否明显降低
@@ -2187,7 +2187,7 @@ reverse-KL、CE=0、temperature=0.6、8 GPU、effective batch 64。使用 stable
 日程：前 30 step 从 `2e-7` 线性 warmup 到 `2e-6`，随后 120 step 恒定保持
 `2e-6`，共 150 optimizer steps。
 
-| 项 | 8192 基线 | Exp #25 |
+| 项 | 8192 基线 | Exp #26 |
 |--|--:|--:|
 | prompt + response 总长上限 | 8192 | **2048** |
 | response 上限 | 剩余总长动态决定 | **1024** |
@@ -2218,12 +2218,12 @@ cap 截断，以及有效 loss token 减少这三种原因。
 
 ---
 
-## Exp #26（2026-09-23 新增）— W3 Vanilla OPD 短上下文 / 短 rollout 消融
+## Exp #27（2026-09-23 新增）— W3 Vanilla OPD 短上下文 / 短 rollout 消融
 
-**目标：** 做 Exp #25 的 W3 对应实验，但保留 W3 自己的训练超参数。以 Exp #2
+**目标：** 做 Exp #26 的 W3 对应实验，但保留 W3 自己的训练超参数。以 Exp #2
 的 W3 Vanilla OPD 为对照，只把 prompt + response 总长上限从 `8192` 改为
 `2048`，并把 response 上限设为 `1024`，检验短 rollout 在 W3 上的速度—性能
-权衡。该实验与 Exp #25 共同观察低 bit 是否比 W3 更依赖长推理轨迹。
+权衡。该实验与 Exp #26 共同观察低 bit 是否比 W3 更依赖长推理轨迹。
 
 **保持不变：** W3A16、group size 128、Exp #1 的同一份 W3 Stage 1、
 OpenThoughts 顺序与 seed、sampled reverse-KL、CE=0、temperature=0.6、8 GPU、
@@ -2231,7 +2231,7 @@ effective batch 64、不训练 embedding。使用 stable 日程：前 30 step �
 线性 warmup 到 W3 峰值 `1e-6`，随后 120 step 恒定保持 `1e-6`，并显式固定
 `max_steps=150`，避免 2048 预过滤改变数据集大小后连带改变 optimizer step 数。
 
-| 项 | W3 8192 基线 | Exp #26 |
+| 项 | W3 8192 基线 | Exp #27 |
 |--|--:|--:|
 | prompt + response 总长上限 | 8192 | **2048** |
 | response 上限 | 剩余总长动态决定 | **1024** |
@@ -2239,7 +2239,7 @@ effective batch 64、不训练 embedding。使用 stable 日程：前 30 step �
 | optimizer steps | 150 | **150** |
 | 最大 prompt presentations | 9600 | **9600** |
 
-**实现与过滤约束：** 与 Exp #25 相同，启动前必须显式实现逐 batch 的 response
+**实现与过滤约束：** 与 Exp #26 相同，启动前必须显式实现逐 batch 的 response
 cap；不能直接依赖 Hugging Face 同时设置 `max_length` 和 `max_new_tokens`。
 prompt-only 过滤条件保持 `prompt_length <= 2047`，并在状态中记录
 `before / after / filtered / max_before / max_after`。150 steps 最多消费 9600 个
@@ -2247,17 +2247,97 @@ prompt；若过滤后不足 9600 条就会重复采样，须报告 unique prompt
 
 **必报结果：** 与 W3 8192 基线按相同 step 比较 GSM8K、MATH-500、平均 response
 length、截断率、EOS 率、累计 rollout tokens、rollout 墙钟时间、sec/step 和
-总训练时间。同时将 Exp #25 / #26 按相同 step 对齐，比较 W2 与 W3 的性能下降和
+总训练时间。同时将 Exp #26 / #27 按相同 step 对齐，比较 W2 与 W3 的性能下降和
 成本下降比例。
 
 **判定：** 若 W3 在 2048/1024 下基本保持分数，而 W2 明显退化，支持“量化容量
 越低，越依赖长轨迹或更完整的 token-level 纠正”；若 W2/W3 都保持性能，则优先
 使用短 rollout 降低 OPD 成本；若两者都退化，则主要是任务长度预算不足。
 
-**依赖：** Exp #1 W3 Stage 1，以及与 Exp #26 日程完全一致的 W3 8192 对照。
+**依赖：** Exp #1 W3 Stage 1，以及与 Exp #27 日程完全一致的 W3 8192 对照。
 训练参数尚未实现，确认前不启动 GPU 训练。
 
 **状态：** 未跑；仅完成实验设计。
+
+---
+
+## Exp #28（2026-09-26 新增）— W2 8192-rollout 末尾重复监督诊断
+
+**问题：** Vanilla OPD 的长 response 中，有多少监督 token 实际落在末尾重复区？
+先做长度与占比诊断，不把“发生重复”直接等同于“监督无效”。
+
+固定 `max_length=8192`、temperature `0.6`、`top_k=0`，从 OpenThoughts train
+按训练口径 `shuffle(seed=2)` 后取前 64 个可生成 prompt。所有 checkpoint 使用
+完全相同的 prompt、顺序和 sampling seed；每次只生成一条轨迹，匹配训练时的
+on-policy 单样本监督。这里是在各 checkpoint 上重新采样的固定 probe rollout，
+不是训练时已经消费过但未保存的历史 rollout；它用于比较不同 checkpoint 的生成
+行为，不能还原某一步实际见过的随机轨迹。分析以下 11 个点：
+
+| step | checkpoint |
+|---:|---|
+| 0 | `output/block_qat/Qwen3-1.7B-w2g128` |
+| 5–30 | `output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-*` |
+| 35–50 | `output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-*` |
+
+检测到的末尾周期重复沿用现有 ShortOPD 口径（period 1–10、末尾 anchor 一致率
+`>=0.9`、至少 64 tokens/3 cycles）；离线统计回溯完整 response，不受训练时
+512-token 检测窗口限制。该长度是 90% 一致率下的近似区间，不视为人工标注的
+精确重复起点。每个 step 必报：
+
+- `repetition_rate`；
+- 平均 response 长度；
+- 平均末尾重复长度（全样本，无重复记 0）及重复样本条件均值；
+- 平均重复前长度 `response_length - terminal_repeat_length`，以及重复样本条件均值；
+- `repeat_token_fraction = sum(repeat_length) / sum(response_length)`；
+- EOS rate 与 hit-max-length rate。
+
+```bash
+python scripts/analyze_rollout_repetition.py \
+  --checkpoint 0=output/block_qat/Qwen3-1.7B-w2g128 \
+  --checkpoint 5=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-5 \
+  --checkpoint 10=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-10 \
+  --checkpoint 15=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-15 \
+  --checkpoint 20=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-20 \
+  --checkpoint 25=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-25 \
+  --checkpoint 30=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold/checkpoint-30 \
+  --checkpoint 35=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-35 \
+  --checkpoint 40=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-40 \
+  --checkpoint 45=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-45 \
+  --checkpoint 50=output/distill/Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-from30hold/checkpoint-50 \
+  --max-length 8192 --num-prompts 64 \
+  --output-dir output/analysis/exp28_rollout_repetition
+```
+
+主表：
+
+| step | repetition rate | response len | repeat len | repeat len (repeated) | pre-repeat len | pre-repeat len (repeated) | repeat-token fraction | EOS rate | hit-max rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | | | | | | | | | |
+| 5 | | | | | | | | | |
+| 10 | | | | | | | | | |
+| 15 | | | | | | | | | |
+| 20 | | | | | | | | | |
+| 25 | | | | | | | | | |
+| 30 | | | | | | | | | |
+| 35 | | | | | | | | | |
+| 40 | | | | | | | | | |
+| 45 | | | | | | | | | |
+| 50 | | | | | | | | | |
+
+**判断：** 若 repeat-token fraction 在早期 checkpoint 很高，说明 OPD 的有效
+token 预算被重复尾部大量占用，但仍不能仅凭长度断言这些梯度无效。下一步只做一组
+因果消融：训练时 mask 掉检测出的重复尾部，并与“随机 mask 相同 token 数”的对照
+比较；前者显著更好才支持“重复 token 监督有害”，持平只支持“冗余”。
+
+**状态：** 统计脚本与记录格式已完成，尚未启动 GPU rollout。
+
+产出：
+
+```text
+output/analysis/exp28_rollout_repetition/probe_manifest.json
+output/analysis/exp28_rollout_repetition/checkpoint-*.jsonl
+output/analysis/exp28_rollout_repetition/summary.{csv,json}
+```
 
 ---
 

@@ -81,6 +81,42 @@ def rollout_truncation_metrics(
 
 
 @torch.no_grad()
+def terminal_repeat_length(
+    tokens: torch.Tensor,
+    max_window: Optional[int] = 512,
+) -> int:
+    """Length of a severe periodic suffix, or zero when none is detected."""
+    if tokens.ndim != 1:
+        raise ValueError("tokens must be a 1-D tensor")
+    suffix = tokens if max_window is None else tokens[-int(max_window):]
+    n = int(suffix.numel())
+    best = None
+    for period in range(1, min(10, n - 1) + 1):
+        matches = (suffix[period:] == suffix[:-period]).float()
+        anchor = min(32, int(matches.numel()))
+        if anchor == 0 or float(matches[-anchor:].mean().item()) < 0.9:
+            continue
+        reverse_mean = matches.flip(0).cumsum(0) / torch.arange(
+            1, matches.numel() + 1, device=matches.device
+        )
+        candidates = (reverse_mean >= 0.9).nonzero(as_tuple=True)[0]
+        if candidates.numel() == 0:
+            continue
+        matched_tail = int(candidates[-1].item()) + 1
+        tail = matched_tail + period
+        agreement = float(reverse_mean[matched_tail - 1].item())
+        severe = (
+            tail >= 64
+            and tail / period >= 3
+            and (tail >= 128 or tail / max(1, n) >= 0.30)
+        )
+        candidate = (tail, agreement, -period)
+        if severe and (best is None or candidate > best):
+            best = candidate
+    return int(best[0]) if best is not None else 0
+
+
+@torch.no_grad()
 def short_opd_rollout_metrics(
     response_tokens: torch.Tensor,
     response_mask: torch.Tensor,
@@ -101,37 +137,10 @@ def short_opd_rollout_metrics(
     for tokens, mask in zip(response_tokens, response_mask.to(torch.bool)):
         valid = tokens[mask]
         response_len = int(valid.numel())
-        suffix = valid[-512:]
-        n = int(suffix.numel())
-        best = None
-        for period in range(1, min(10, n - 1) + 1):
-            matches = (suffix[period:] == suffix[:-period]).float()
-            anchor = min(32, int(matches.numel()))
-            if anchor == 0 or float(matches[-anchor:].mean().item()) < 0.9:
-                continue
-            reverse_mean = matches.flip(0).cumsum(0) / torch.arange(
-                1, matches.numel() + 1, device=matches.device
-            )
-            candidates = (reverse_mean >= 0.9).nonzero(as_tuple=True)[0]
-            if candidates.numel() == 0:
-                continue
-            matched_tail = int(candidates[-1].item()) + 1
-            tail = matched_tail + period
-            agreement = float(reverse_mean[matched_tail - 1].item())
-            severe = (
-                tail >= 64
-                and tail / period >= 3
-                and (tail >= 128 or tail / max(1, n) >= 0.30)
-            )
-            candidate = (tail, agreement, -period)
-            if severe and (best is None or candidate > best):
-                best = candidate
-
-        is_repeated = best is not None
+        repeat_len = terminal_repeat_length(valid)
+        is_repeated = repeat_len > 0
         repeated += int(is_repeated)
-        effective_lengths.append(
-            max(0, response_len - best[0]) if is_repeated else response_len
-        )
+        effective_lengths.append(max(0, response_len - repeat_len))
         clean_truncated += int(
             not is_repeated and response_len >= int(rollout_budget)
         )

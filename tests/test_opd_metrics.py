@@ -16,6 +16,7 @@ from quantize.opd_metrics import (
     merge_timeline,
     rollout_truncation_metrics,
     short_opd_rollout_metrics,
+    terminal_repeat_length,
 )
 from quantize.quantizer import UniformAffineQuantizer
 
@@ -60,6 +61,8 @@ def test_short_opd_detects_terminal_loop_and_clean_truncation():
     assert m["shortopd_repetition_rate"] == 0.5
     assert m["shortopd_clean_truncation_rate"] == 0.5
     assert 150.0 < m["shortopd_effective_length"] < 200.0
+    assert terminal_repeat_length(loop) > 128
+    assert terminal_repeat_length(clean) == 0
 
 
 def test_integer_codes_and_jump():
