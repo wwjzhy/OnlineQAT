@@ -2341,6 +2341,90 @@ output/analysis/exp28_rollout_repetition/summary.{csv,json}
 
 ---
 
+## Exp #29（2026-09-29 新增）— W2 2048/1024 OPD 只训练高熵 Top-25% token
+
+**问题：** Stage 1 后的 W2 短 rollout OPD 是否可以丢弃低熵 token，只用每条
+student rollout 中熵最高的 25% response token，保持或提升下游性能？
+
+**保持不变：** 与 Exp #26 的短上下文基线相同：读取 Exp #4 的 W2 Stage 1，
+W2A16、group size 128、student on-policy rollout、sampled reverse-KL、CE=0、
+`max_length=2048`、response cap `1024`、temperature `0.6`、8 GPU、effective
+batch 64；前 30 step 从 `2e-7` warmup 到 `2e-6`，随后 120 step 恒定
+`2e-6`，共 150 steps。每个 batch 的实际 response budget 仍是
+`min(1024, 2048 - padded_prompt_len)`，prompt-only 过滤口径也与 Exp #26 相同。
+
+**唯一方法改动：** 对每条 rollout 的有效 response token，用 detached W2 student
+在 temperature `0.6` 下、top-k 之前的全词表分布计算 entropy。令
+`k=ceil(0.25*N_response)`，只保留 entropy 最高的 k 个 token 参与 OPD loss；
+prompt、padding 不参与排序。mask 不反传，tie 用 response position 稳定打破。
+
+为避免把 token 筛选与约 4 倍 loss 放大混在一起，主实验保持 Vanilla 的分母：
+
+\[
+L_{\mathrm{High25}}
+=\frac{1}{N_{\mathrm{valid}}}\sum_t
+m_t^{\mathrm{High25}}\,\ell_t^{\mathrm{OPD}}.
+\]
+
+不要除以保留下来的 `0.25*N_valid`，不要同时改学习率、advantage、rollout 长度
+或采样参数。该实验只减少反向监督 token，不减少 rollout 和 teacher/student
+forward，因此不预期训练时间直接下降 75%。
+
+**最小对照：**
+
+| 分支 | loss token | 分母 | 用途 |
+|---|---:|---:|---|
+| Vanilla-2048/1024 | 100% | 全部有效 token | Exp #26 基线 |
+| High25-matched | 每条轨迹高熵 25% | 全部有效 token | 主实验 |
+| Random25-matched | 每条轨迹随机 25% | 全部有效 token | 排除仅由稀疏化造成的效果 |
+
+三组必须使用同一 Stage 1、2048/1024 长度预算、prompt 顺序、sampling seed、
+训练日程和 checkpoint 评测点。Random25 每条轨迹保留与 High25 完全相同的
+token 数。由于 Exp #26 的短上下文本身可能使 GSM8K 退化，本实验的直接基线必须
+是 Exp #26，不能拿 8192 Vanilla 单独判断 entropy mask 的收益。
+
+**监控与必报：**
+
+| 类别 | 指标 | 目的 |
+|---|---|---|
+| 下游效果 | 每 5 step 的 GSM8K、MATH-500；best、final、step-aligned 曲线均值 | 判断是否收敛及是否优于对照 |
+| token 筛选 | entropy P50/P75/P90、P75 阈值、实际 keep rate、保留/丢弃 token 的平均 entropy | 确认每条轨迹确实保留高熵 25% |
+| 梯度覆盖 | `R_high=sum(G_high)/sum(G_all)`、保留/丢弃 token 的平均 `|A|` 与 `G` | 判断高熵 token 是否持续覆盖主要 OPD 更新 |
+| 优化稳定性 | OPD loss、grad norm、learning rate、NaN/Inf、code-jump rate | 排除筛选后梯度过小、尖峰或量化码震荡 |
+| rollout 行为 | response length、EOS rate、hit-max/truncation rate、repetition rate | 排除输出变短、顶满或重复导致的伪收益 |
+| 训练成本 | rollout seconds/step、total seconds/step、总墙钟 | 确认该方法的实际成本；不预设会节省 75% |
+
+其中 `G_t=2|A_t|(1-p_t)` 只作 logit-gradient 诊断，不作为新的训练权重。
+`keep_rate` 应稳定在约 0.25；若明显偏离，先修 mask，不解释 benchmark。
+
+**收敛口径：** 以 GSM8K/MATH-500 的 checkpoint 曲线进入平台且后续不持续
+下降为准，不能只凭 OPD loss 下降判断收敛。三组必须按相同 step 比较 best、final
+和曲线均值，避免只挑单个波动峰值。
+
+**判定：** High25-matched 与 Vanilla 持平或更好，且显著优于
+Random25-matched，才支持“高熵 token 是更有效的 OPD 监督区域”；若仅与 Random25
+相当，只能说明低熵 token 冗余；若明显退化，则高熵覆盖梯度质量不等于覆盖有效
+学习信号。单次 seed 只作筛选，正结果至少补 3 seeds。
+
+```bash
+# 以下参数尚待实现；实现后再启动训练。
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-length 2048 --response-cap 1024 --max-steps 150 --save-steps 5 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --entropy-token-fraction 0.25 --entropy-mask-denominator all \
+  --run-suffix short2048-entropy-top25
+```
+
+**依赖：** `output/block_qat/Qwen3-1.7B-w2g128/config.json`。需要先实现并测试
+Exp #26 的逐 batch response cap、entropy mask、全有效 token 分母及 Random25
+对照参数；确认前不启动 GPU。
+
+**状态：** 未跑；仅完成实验设计。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
