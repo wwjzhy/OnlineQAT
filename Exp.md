@@ -2425,6 +2425,69 @@ Exp #26 的逐 batch response cap、entropy mask、全有效 token 分母及 Ran
 
 ---
 
+## Exp #30（2026-10-01 新增）— W2 Vanilla OPD 平台期扩大 rollout horizon
+
+**问题：** Exp #29 的 Vanilla `2048/1024` 分支在 step 150 附近增益放缓，
+究竟是继续训练本身已无收益，还是 `max_length=2048`、response cap `1024`
+限制了 W2 OPD 能访问的后段状态？
+
+**起点与唯一变量：** 两个分支都从同一个 Vanilla Trainer
+`checkpoint-150` 恢复权重、Adam 和 scheduler，再续训 20 optimizer steps 到
+global step 170。保持 W2A16、group size 128、sampled reverse-KL、CE=0、
+temperature `0.6`、effective batch 64、prompt 顺序、sampling seed 和 stable LR
+`2e-6` 不变；不重新 warmup。只改变长度预算：
+
+| 分支 | max_length | response cap | 实际 response budget | 用途 |
+|---|---:|---:|---|---|
+| Control | 2048 | 1024 | `min(1024, 2048-padded_prompt_len)` | 排除单纯多训 20 step |
+| Medium | 3072 | 2048 | `min(2048, 3072-padded_prompt_len)` | 检验扩大 horizon 是否重新带来增益 |
+
+两个分支必须复用 Exp #29 Vanilla 实际消费的同一份 prompt manifest，不能让
+`max_length=3072` 重新放进更长 prompt；否则同时改变了 prompt 分布。必须从同一个
+完整 Trainer checkpoint 分叉，不能一个分支接着另一个分支跑；若只有评测快照、
+无法恢复 optimizer，则两支都改为相同的 weight-only warm start，并明确标记为
+重新起训，不能与真续训混报。
+
+**评测与监控：** 在 global step `160/170` 评测 GSM8K 和 MATH-500，并同时报告
+两点均值与 final，避免用单个波动峰值判断。训练时继续记录 response mean/P90、
+EOS rate、hit-max/truncation rate、repetition rate、累计 rollout tokens、OPD loss、
+grad norm、rollout seconds/step 和总墙钟；额外按 `0-1024`、`1024-2048` 两段统计
+有效 token 数及 loss/advantage 质量，确认新增后段是否真正提供监督。
+
+**判定：** Medium 在 step 160/170 都优于 Control，且新增后段没有明显推高重复率
+或训练不稳定，才支持“短 rollout horizon 限制了当前平台”；若两支持平，说明主要
+是目标或优化平台；若 Medium 更差并伴随重复/截断上升，说明更长后段主要引入噪声。
+本轮不跑 `4096/3072`：只有 Medium 显示稳定正增益后才增加该分支。
+
+```bash
+# 以下以完整 Trainer checkpoint-150 为例；<base-tag> 替换为 Exp #29 Vanilla tag。
+# Control：保持 2048/1024，只续训到 global step 170。
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-length 2048 --response-cap 1024 --max-steps 170 --save-steps 10 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --resume-from log/distill/<base-tag>/checkpoint-150 \
+  --run-suffix horizon-control-cont20
+
+# Medium：同一起点，仅把总长/response cap 改为 3072/2048。
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-length 3072 --response-cap 2048 --max-steps 170 --save-steps 10 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --resume-from log/distill/<base-tag>/checkpoint-150 \
+  --run-suffix horizon-medium-cont20
+```
+
+**依赖：** Exp #29 Vanilla 的完整 `checkpoint-150`，以及 Exp #26 已实现的逐 batch
+`response-cap`。本地公共脚本尚未暴露 `--response-cap` 时，不得直接执行上述命令，
+须先同步已有实现；本实验不重复实现第二套长度控制。
+
+**状态：** 未跑；实验设计已确认。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：
