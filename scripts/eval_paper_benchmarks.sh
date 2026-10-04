@@ -23,7 +23,7 @@
 #   EVAL_DATASETS       space-separated dataset override
 #   VLLM_API_URL        skip serve; eval against this OpenAI base (…/v1)
 #   SERVED_MODEL_NAME   must match vLLM --served-model-name if VLLM_API_URL is set
-#   ENABLE_THINKING     1: force Qwen3 thinking on via extra_body (default unset = vLLM template default)
+#   ENABLE_THINKING     1: force on; 0: force off; unset: vLLM template default
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -137,6 +137,11 @@ fi
 EXTRA_BODY='{"top_k": 20}'
 if [[ "${ENABLE_THINKING:-}" == "1" ]]; then
   EXTRA_BODY='{"top_k": 20, "enable_thinking": true, "chat_template_kwargs": {"enable_thinking": true}}'
+elif [[ "${ENABLE_THINKING:-}" == "0" ]]; then
+  EXTRA_BODY='{"top_k": 20, "enable_thinking": false, "chat_template_kwargs": {"enable_thinking": false}}'
+elif [[ -n "${ENABLE_THINKING:-}" ]]; then
+  echo "ENABLE_THINKING must be 0, 1, or unset" >&2
+  exit 1
 fi
 
 echo "eval  model=${SERVED_MODEL_NAME}"

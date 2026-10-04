@@ -2488,6 +2488,84 @@ bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
 
 ---
 
+## Exp #31（2026-10-04 新增）— W2 Non-Thinking OPD 60-step 对照
+
+**问题：** Exp #26 / #29 的 `2048/1024` Vanilla OPD 使用 Qwen3 thinking
+轨迹。本实验只关闭 rollout 的 thinking mode，检验较短、直接作答的 student
+trajectory 能否更快恢复 W2 精度。该实验是 thinking-mode 消融，不把
+non-thinking 默认当作更优训练方式。
+
+**起点与唯一变量：** 从 Exp #4 的同一份 W2 Stage 1 权重重新起训。除
+`enable_thinking=False` 外，保持 Exp #26 的 Vanilla `2048/1024` 设置不变：
+W2A16、group size 128、OpenThoughts 顺序与 seed、sampled reverse-KL、CE=0、
+temperature `0.6`、8 GPU、effective batch 64、不训练 embedding。训练 60 个
+optimizer steps：前 30 step 从 `2e-7` 线性 warmup 到 `2e-6`，后 30 step 恒定
+保持 `2e-6`。
+
+| 项 | Thinking 对照 | Exp #31 |
+|---|---:|---:|
+| Stage 1 起点 | Exp #4 W2 | **相同** |
+| max length（prompt + response） | 2048 | **2048** |
+| response cap | 1024 | **1024** |
+| 实际 response budget | `min(1024, 2048-padded_prompt_len)` | **相同** |
+| rollout mode | thinking on | **thinking off** |
+| optimizer steps | 60 | **60** |
+
+**实现闸门：** 训练必须显式传 `--non-thinking`，不能依赖 tokenizer 或 vLLM
+默认值。prompt-only 长度过滤和实际 data collator 必须使用同一个
+`enable_thinking=False` 模板。启动后保存一条格式化 prompt 和一条 rollout，确认
+日志显示 `thinking=off response_cap=1024`，且模型没有进入自由生成的 thinking
+段；不满足就停，不要把该运行记为 Exp #31。
+
+**评测：** 保存 step `10/20/30/40/50/60`，至少评 GSM8K 和 MATH-500。主比较
+使用 `ENABLE_THINKING=0`，并在 step `0/30/60` 额外用 `ENABLE_THINKING=1`
+交叉评测，区分“non-thinking 部署本身更合适”和“non-thinking rollout 学到的更新
+也能迁移到原 thinking 模式”。Thinking 对照必须取相同 Stage 1、相同
+`2048/1024`、相同 step 的 Vanilla checkpoint，不能拿 150-step final 比。
+
+**必须监控：** GSM8K、MATH-500、response mean/P90、EOS rate、
+hit-max/truncation rate、repetition rate、累计 rollout tokens、OPD loss、grad norm、
+rollout seconds/step、总墙钟。另报告 non-thinking 相对 thinking 对照的
+score-per-hour 和 score-per-million-rollout-tokens；单个 checkpoint 的波动峰值不算
+收益。
+
+**判定：** Exp #31 在 step `40/50/60` 至少两个点优于相同 step 的 Thinking
+对照，且非思考模式下的长度、截断率或墙钟明显下降，才支持“non-thinking rollout
+提高早期 OPD 效率”。若只在 non-thinking 评测中占优、thinking-on 交叉评测不升，
+则结论仅是模式专用适配；若两种评测都不升，则 thinking horizon 不是当前平台期的
+主要原因。
+
+```bash
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+conda activate reasoningqat
+
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage all \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-length 2048 --response-cap 1024 --non-thinking \
+  --max-steps 60 --save-steps 10 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --run-suffix exp31-60step
+
+# final checkpoint：先做模式匹配评测，再做 thinking-on 交叉评测。
+TAG=Qwen3-1.7B-w2g128-opd-lr2e-6-wu30-ws2e-7-schhold-rc1024-nonthink-exp31-60step
+ENABLE_THINKING=0 EVAL_DATASETS="gsm8k math_500" MAX_TOKENS=1024 \
+  bash scripts/eval_paper_benchmarks.sh \
+  "output/vllm/${TAG}" "output/eval/${TAG}-nonthink"
+
+ENABLE_THINKING=1 EVAL_DATASETS="gsm8k math_500" MAX_TOKENS=1024 \
+  bash scripts/eval_paper_benchmarks.sh \
+  "output/vllm/${TAG}" "output/eval/${TAG}-thinking"
+```
+
+**依赖：** Exp #4 W2 Stage 1；相同 60-step 的 Exp #26 Vanilla 对照。代码要求
+`run_qwen3_1.7b_opd.sh` 支持 `--response-cap` 和 `--non-thinking`，评测脚本支持
+`ENABLE_THINKING=0/1`。
+
+**状态：** 未跑；实验设计和显式 thinking/response-cap 开关已加入。
+
+---
+
 ## 续训 / Resume（2026-09-06）
 
 `--save-steps N` 现在会同时写两套东西：

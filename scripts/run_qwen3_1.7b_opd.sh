@@ -49,6 +49,8 @@ GATE_PATIENCE="2"
 GATE_START_STEP="30"
 GATE_EMA_BETA="0.9"
 TOP_K="20"
+RESPONSE_CAP="0"
+NON_THINKING=0
 
 MODEL="${MODEL_PATH:-/zju_0038/zq/models/Qwen3-1.7B}"
 TEACHER="${TEACHER_MODEL:-${MODEL}}"
@@ -81,6 +83,8 @@ Options:
   --stage {all|2|3}      2=distill, 3=convert, all=2 then 3 (default: all)
   --gpus ID,ID,...       GPUs for Stage 2 (default: all visible)
   --max-length N         Distill sequence length (default: 8192)
+  --response-cap N       Fixed response-token cap per batch (0=remaining max length)
+  --non-thinking         Render Qwen3 rollout prompts with enable_thinking=false
   --model PATH           Base model (only used to check the path exists)
   --teacher PATH         Teacher model for Stage 2 (default: same as --model)
   --train-emb            Also train embed_tokens in Stage 2
@@ -139,6 +143,8 @@ while [[ $# -gt 0 ]]; do
     --stage) STAGE="$2"; shift 2 ;;
     --gpus) DISTILL_GPUS="$2"; shift 2 ;;
     --max-length) MAX_LENGTH="$2"; shift 2 ;;
+    --response-cap) RESPONSE_CAP="$2"; shift 2 ;;
+    --non-thinking) NON_THINKING=1; shift ;;
     --model) MODEL="$2"; shift 2 ;;
     --teacher) TEACHER="$2"; shift 2 ;;
     --train-emb) TRAIN_EMB=1; shift ;;
@@ -182,6 +188,10 @@ if [[ "${STAGE}" != "all" && "${STAGE}" != "2" && "${STAGE}" != "3" ]]; then
 fi
 if [[ "${SHORT_OPD}" -eq 1 && "${MIXED_OPD}" -eq 1 ]]; then
   echo "--short-opd and --mixed-opd are mutually exclusive" >&2
+  exit 1
+fi
+if [[ "${RESPONSE_CAP}" -lt 0 || "${RESPONSE_CAP}" -gt "${MAX_LENGTH}" ]]; then
+  echo "--response-cap must be between 0 and --max-length" >&2
   exit 1
 fi
 if [[ ! -f "${MODEL}/config.json" ]]; then
@@ -230,6 +240,12 @@ fi
 if [[ -n "${LR_SCHEDULER}" && "${LR_SCHEDULER}" != "linear" ]]; then
   SCH_TAG="$(printf '%s' "${LR_SCHEDULER}" | tr '[:upper:]' '[:lower:]' | tr '-' '_' | sed 's/constant_with_warmup/hold/')"
   DISTILL_TAG="${DISTILL_TAG}-sch${SCH_TAG}"
+fi
+if [[ "${RESPONSE_CAP}" -gt 0 ]]; then
+  DISTILL_TAG="${DISTILL_TAG}-rc${RESPONSE_CAP}"
+fi
+if [[ "${NON_THINKING}" -eq 1 ]]; then
+  DISTILL_TAG="${DISTILL_TAG}-nonthink"
 fi
 if [[ -n "${RUN_SUFFIX}" ]]; then
   DISTILL_TAG="${DISTILL_TAG}-${RUN_SUFFIX}"
@@ -360,6 +376,11 @@ elif [[ "${MIXED_OPD}" -eq 1 ]]; then
   )
 fi
 
+ROLLOUT_FLAGS=(--response_cap "${RESPONSE_CAP}")
+if [[ "${NON_THINKING}" -eq 1 ]]; then
+  ROLLOUT_FLAGS+=(--disable_thinking)
+fi
+
 if [[ -n "${EVAL_GPU}" ]]; then
   case ",${DISTILL_GPUS}," in
     *",${EVAL_GPU},"*)
@@ -390,6 +411,7 @@ if [[ "${MIXED_OPD}" -eq 1 ]]; then
 fi
 echo "  lr=${DISTILL_LR} (default ${DEFAULT_DISTILL_LR})  warmup_steps=${WARMUP_STEPS:-ratio0.2}  warmup_start_lr=${WARMUP_START_LR:-0}"
 echo "  lr_scheduler=${LR_SCHEDULER:-linear}  save_steps=${SAVE_STEPS}  max_steps=${MAX_STEPS:-epochs}  eval_gpu=${EVAL_GPU:-none}"
+echo "  response_cap=$([[ "${RESPONSE_CAP}" -gt 0 ]] && echo "${RESPONSE_CAP}" || echo remaining)  thinking=$([[ "${NON_THINKING}" -eq 1 ]] && echo off || echo on)"
 echo "  resume=${RESUME}  resume_from=${RESUME_FROM:-auto}  init_from=${INIT_FROM:-none}  run_suffix=${RUN_SUFFIX:-none}"
 echo "Stage 3 GPU : ${CONVERT_GPU}"
 echo "Inputs / outputs:"
@@ -449,6 +471,7 @@ if run_stage 2; then
       --kl_weight 1.0 \
       --cross_entropy_weight 0.0 \
       "${OPD_FLAGS[@]}" \
+      "${ROLLOUT_FLAGS[@]}" \
       --dataset_type "${DATASET_TYPE}" \
       --dataset_size "${DATASET_SIZE}" \
       --max_length "${MAX_LENGTH}" \

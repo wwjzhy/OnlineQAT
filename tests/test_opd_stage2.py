@@ -18,7 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GenerationConfig
 
-from main_e2e_distill import PolicyGKDTrainer, scheduler_type_name
+from main_e2e_distill import (
+    ChatTemplateModeTokenizer,
+    PolicyGKDTrainer,
+    opd_rollout_budget,
+    scheduler_type_name,
+)
 from trl.trainer.gkd_trainer import GKDTrainer
 
 
@@ -313,6 +318,24 @@ def test_generation_budget_is_total_max_length_not_extra_new_tokens():
     assert out.shape[1] == 32
 
 
+def test_fixed_response_cap_respects_total_length():
+    assert opd_rollout_budget(2048, 400, 1024) == 1024
+    assert opd_rollout_budget(2048, 1500, 1024) == 548
+    assert opd_rollout_budget(2048, 400, 0) == 1648
+
+
+def test_chat_template_mode_is_explicit():
+    class Tokenizer:
+        pad_token_id = 0
+
+        def apply_chat_template(self, *args, **kwargs):
+            return kwargs["enable_thinking"]
+
+    wrapped = ChatTemplateModeTokenizer(Tokenizer(), enable_thinking=False)
+    assert wrapped.apply_chat_template([]) is False
+    assert wrapped.apply_chat_template([], enable_thinking=True) is False
+
+
 def test_opd_masks_keep_first_eos_and_drop_later_padding():
     generated = torch.tensor(
         [
@@ -360,6 +383,8 @@ def test_scripts_gkd_vs_opd_flags():
     assert "--resume-from" in opd
     assert "--init-from" in opd
     assert "--run-suffix" in opd
+    assert "--response-cap" in opd
+    assert "--non-thinking" in opd
     assert "eval_distill_checkpoints.sh" in opd
     src = (ROOT / "main_e2e_distill.py").read_text()
     assert "resume_from_checkpoint=last_checkpoint" in src
@@ -519,6 +544,8 @@ if __name__ == "__main__":
         test_short_opd_controller_shrinks_on_repetition,
         test_opd_replaces_batch_with_student_rollout_and_masks_prompt,
         test_generation_budget_is_total_max_length_not_extra_new_tokens,
+        test_fixed_response_cap_respects_total_length,
+        test_chat_template_mode_is_explicit,
         test_opd_masks_keep_first_eos_and_drop_later_padding,
         test_scripts_gkd_vs_opd_flags,
         test_policy_trainer_beta_default_is_none,

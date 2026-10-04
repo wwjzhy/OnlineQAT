@@ -60,6 +60,31 @@ torch.backends.cudnn.benchmark = True
 from trl.trainer.utils import DataCollatorForChatML
 
 
+class ChatTemplateModeTokenizer:
+    """Delegate tokenization while fixing Qwen3's thinking template mode."""
+
+    def __init__(self, tokenizer, enable_thinking):
+        self._tokenizer = tokenizer
+        self.enable_thinking = bool(enable_thinking)
+
+    def __call__(self, *args, **kwargs):
+        return self._tokenizer(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._tokenizer, name)
+
+    def apply_chat_template(self, *args, **kwargs):
+        kwargs["enable_thinking"] = self.enable_thinking
+        return self._tokenizer.apply_chat_template(*args, **kwargs)
+
+
+def opd_rollout_budget(max_length, prompt_width, response_cap=0):
+    budget = int(max_length) - int(prompt_width)
+    if response_cap and response_cap > 0:
+        budget = min(budget, int(response_cap))
+    return budget
+
+
 class ChunkedActionLogProbs(torch.autograd.Function):
     """FP32 log-softmax with chunked backward recomputation.
 
@@ -222,6 +247,7 @@ class PolicyGKDTrainer(GKDTrainer):
         short_opd_growth=1.25,
         short_opd_stat_ema=0.70,
         short_opd_budget_ema=0.70,
+        response_cap=0,
         pv_opd_mode=False,
         pv_probe_bits=4,
         pv_gate_mode="full",
@@ -266,6 +292,7 @@ class PolicyGKDTrainer(GKDTrainer):
         self.short_opd_stat_ema = float(short_opd_stat_ema)
         self.short_opd_budget_ema = float(short_opd_budget_ema)
         self.short_opd_budget = self.short_opd_max_tokens
+        self.response_cap = int(response_cap or 0)
         self._short_opd_data_step = None
         self._short_opd_accum = []
         self._short_opd_ema = {
@@ -771,8 +798,14 @@ class PolicyGKDTrainer(GKDTrainer):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             rollout_t0 = time.perf_counter()
-            batch_rollout_budget = max_length - int(prompts.shape[1])
+            batch_rollout_budget = opd_rollout_budget(
+                max_length,
+                prompts.shape[1],
+                self.response_cap,
+            )
             old_max_new_tokens = self.generation_config.max_new_tokens
+            if self.response_cap > 0:
+                self.generation_config.max_new_tokens = batch_rollout_budget
             if getattr(self, "short_opd_mode", False):
                 batch_rollout_budget = min(
                     int(self.short_opd_budget),
@@ -804,7 +837,7 @@ class PolicyGKDTrainer(GKDTrainer):
                 eos_token_id=self.generation_config.eos_token_id,
                 max_length=(
                     int(prompts.shape[1]) + batch_rollout_budget
-                    if getattr(self, "short_opd_mode", False)
+                    if getattr(self, "short_opd_mode", False) or self.response_cap > 0
                     else max_length
                 ),
                 pad_token_id=self.processing_class.pad_token_id,
@@ -1483,7 +1516,7 @@ def format_openthoughts_sample(example):
     }
 
 
-def openthoughts_prompt_length(example, tokenizer):
+def openthoughts_prompt_length(example, tokenizer, enable_thinking=True):
     """Tokenized prompt-only length, matching chat generation formatting."""
     messages = format_openthoughts_sample(example["conversations"])["messages"]
     if messages and messages[-1].get("role") == "assistant":
@@ -1492,6 +1525,7 @@ def openthoughts_prompt_length(example, tokenizer):
         messages,
         tokenize=True,
         add_generation_prompt=True,
+        enable_thinking=enable_thinking,
     )
     return len(token_ids)
 
@@ -1560,6 +1594,14 @@ def process_math_data(sample):
 @dataclass
 class CustomDataCollatorForChatML(DataCollatorForChatML):
     original_key = "conversations"
+    enable_thinking: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.tokenizer = ChatTemplateModeTokenizer(
+            self.tokenizer,
+            self.enable_thinking,
+        )
 
     def convert_to_messages(self, examples):
         messages = []
@@ -1723,6 +1765,17 @@ def main():
     parser.add_argument("--optim", type=str, default="adamw_torch", help="optimizer")
     parser.add_argument("--max_length", type=int, default=None, help="maximum sequence length")
     parser.add_argument(
+        "--response_cap",
+        type=int,
+        default=0,
+        help="OPD: fixed maximum generated response tokens per batch (0 uses remaining max_length)",
+    )
+    parser.add_argument(
+        "--disable_thinking",
+        action="store_true",
+        help="Render Qwen3 training prompts with enable_thinking=False",
+    )
+    parser.add_argument(
         "--min_rollout_tokens",
         type=int,
         default=1,
@@ -1782,6 +1835,10 @@ def main():
     args = parser.parse_args()
     if sum((args.opd, args.short_opd, args.mixed_opd, args.pv_opd)) > 1:
         parser.error("--opd, --short_opd, --mixed_opd, and --pv_opd are mutually exclusive")
+    if args.response_cap < 0 or (
+        args.response_cap > 0 and args.response_cap > (args.max_length or 8192)
+    ):
+        parser.error("--response_cap must be 0 or no larger than --max_length")
     if args.short_opd and not (
         0 < args.short_opd_min_tokens <= args.short_opd_max_tokens <= (args.max_length or 8192)
         and 0 <= args.short_opd_rho_low < args.short_opd_rho_high <= 1
@@ -1954,7 +2011,11 @@ def main():
         dataset = load_dataset("open-thoughts/OpenThoughts3-1.2M", split="train", verification_mode="no_checks")
         dataset = dataset.shuffle(seed=args.seed)
         logger.info(f"Using OpenThoughts dataset: open-thoughts/OpenThoughts3-1.2M")
-        data_collator = CustomDataCollatorForChatML(tokenizer=tokenizer, max_length=args.max_length)
+        data_collator = CustomDataCollatorForChatML(
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            enable_thinking=not args.disable_thinking,
+        )
 
         end_index = args.dataset_start_index + args.dataset_size
         actual_end_index = min(end_index, len(dataset))
@@ -1990,7 +2051,11 @@ def main():
 
         dataset = dataset.shuffle(seed=args.seed)
         logger.info(f"Using OpenThoughts math dataset: open-thoughts/OpenThoughts3-1.2M (math domain)")
-        data_collator = CustomDataCollatorForChatML(tokenizer=tokenizer, max_length=args.max_length)
+        data_collator = CustomDataCollatorForChatML(
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            enable_thinking=not args.disable_thinking,
+        )
 
         end_index = args.dataset_start_index + args.dataset_size
         actual_end_index = min(end_index, len(dataset))
@@ -2003,7 +2068,11 @@ def main():
         before_filter = len(dataset)
         dataset = dataset.map(
             lambda example: {
-                "_opd_prompt_length": openthoughts_prompt_length(example, tokenizer)
+                "_opd_prompt_length": openthoughts_prompt_length(
+                    example,
+                    tokenizer,
+                    enable_thinking=not args.disable_thinking,
+                )
             },
             desc="Measuring OPD prompt lengths",
         )
@@ -2163,6 +2232,7 @@ def main():
         short_opd_growth=args.short_opd_growth,
         short_opd_stat_ema=args.short_opd_stat_ema,
         short_opd_budget_ema=args.short_opd_budget_ema,
+        response_cap=args.response_cap,
         pv_opd_mode=args.pv_opd,
         pv_probe_bits=args.pv_probe_bits,
         pv_gate_mode=args.pv_gate_mode,
@@ -2203,6 +2273,7 @@ def main():
             f"{'ShortOPD' if args.short_opd else 'PV-OPD' if args.pv_opd else 'Mixed-OPD' if args.mixed_opd else 'OPD'} enabled: "
             f"student rollout lmbda=1 "
             f"max_length={trainer.generation_config.max_length} kd_loss_type={args.kd_loss_type} "
+            f"response_cap={args.response_cap or 'none'} thinking={'off' if args.disable_thinking else 'on'} "
             f"top_k={args.top_k} ce_weight={args.cross_entropy_weight} "
             f"probe_bits={args.pv_probe_bits if args.pv_opd else 'none'} "
             f"pv_gate_normalization={args.pv_gate_normalization if args.pv_opd else 'none'} "
