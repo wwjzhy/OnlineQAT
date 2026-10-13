@@ -2713,3 +2713,175 @@ plots: output/plots/<tag>/timeline.png
 # 状态里填结果报告清单（分数 + 时间）
 ```
 ```
+
+---
+
+## Exp #32（2026-10-10 新增）— W2 Short-OPD Reward-Top20 token selection
+
+**问题：** 参考 DIAL-OPD（https://arxiv.org/abs/2610.11659）的机制分析，检验
+W2 短 rollout OPD 是否不需要在全部 response token 上训练，而只保留每条
+student rollout 中 sampled reverse-KL reward 绝对值最高的 20% token，就能更快、
+更稳定地恢复量化模型能力。本实验是 Reward-Top 机制消融，不是完整的 DIAL-OPD；
+不引入 logarithmic-mean score 或 beta。
+
+**起点与唯一变量：** 从 Exp #4 的同一份 W2 Stage 1 权重重新起训，直接对照
+Exp #26 的 Vanilla `2048/1024` 短 rollout。除 loss token mask 外全部锁死：
+W2A16、group size 128、同一 BF16 Qwen3-1.7B teacher、OpenThoughts prompt
+manifest / 顺序 / seed、thinking on、sampled reverse-KL、CE=0、temperature `0.6`、
+8 GPU、effective batch 64、不训练 embedding。`max_length=2048`、response cap
+`1024`，每个 batch 的实际 response budget 为
+`min(1024, 2048-padded_prompt_len)`。
+
+**训练日程：** 共 **70 optimizer steps**。step 1–30 从 `2e-7` 线性 warmup 到
+`2e-6`；step 31–70 使用 `constant_with_warmup` 固定 `2e-6`。保存 step
+`10/20/30/40/50/60/70`。Baseline 使用相同 Stage 1、相同 70-step 日程的
+Vanilla Short-OPD；若复用 Exp #26，必须确认模型 hash、prompt manifest、seed、
+代码版本和上述公共配置一致，否则同 commit 重跑 70-step baseline。
+
+**Reward-Top20 定义：** 对 response `i` 的有效位置集合 `V_i`，排除 prompt、
+padding、terminal EOS 和 EOS 后区域。令 sampled token 在当前 student / teacher
+下的概率为 `p_s` / `p_t`，并使用与 OPD loss 相同的 temperature-scaled 分布：
+
+```text
+r_t = log(p_t) - log(p_s)
+K_i = max(1, round(0.20 * |V_i|))
+S_i = 每条 response 内按 |r_t| 降序的前 K_i 个位置
+```
+
+不能跨 response 做 batch-level Top-K。所有 token 仍留在上下文中，只有 `S_i`
+参与 loss。选择 mask 与 reward 必须 detach；排序不能反传。loss 保留原 reward
+符号，按所有 selected token 归一化：
+
+```text
+loss = -sum_{i,t in S_i} sg(r_it) * log p_s(y_it | c_it) / sum_i K_i
+```
+
+分母是 selected token 数，不是全部有效 token 数；这是本实验对齐 DIAL-OPD 的
+口径。不要同时修改 LR、reward clipping、rollout 长度、采样方式或 loss 权重。
+
+**必须记录：** 每 step 记录 eligible / selected token 数与实际 keep rate；全部、
+selected、unselected token 的 `|r|` mean/P50/P80/P95/max；selected token 的
+`logp_student`、`logp_teacher`；loss、LR、grad norm、code jump、response
+mean/P90、EOS、truncation、repetition、rollout seconds、step seconds 和累计
+rollout tokens。额外记录 low-low token 在全部 token、selected token 和 selected
+absolute reward 中的占比，供 Exp #33 对照。
+
+**评测：** step `0/10/20/30/40/50/60/70` 评 GSM8K 和 MATH-500，报告早期
+`10–40` 均值、后期 `50–70` 均值、best、final 和最后三个 checkpoint 均值。
+若主结果为正，对 best 和 final 跑公共约定完整 benchmark；单点峰值不算收益。
+
+**判定：** Reward-Top20 在 step `40/50/60/70` 至少三个点优于 step-aligned
+Vanilla，且后期两任务均值、最后三点均值与 grad norm 稳定性不差，才支持
+“W2 OPD 的有效监督集中在高 disagreement token”。若只提升一个任务，结论只能
+写成任务间收益重分配。
+
+**实现闸门：** 当前脚本尚未提供以下参数；实现和 1-step smoke test 通过前不得
+启动正式训练。目标接口：
+
+```bash
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-length 2048 --response-cap 1024 --max-steps 70 --save-steps 10 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --opd-token-selection reward_top --opd-token-retention 0.20 \
+  --opd-mask-denominator selected \
+  --run-suffix short2048-rewardtop20-s70
+```
+
+Smoke test 必须输出一条逐 token debug 表：`position/token/logp_s/logp_t/r/abs_r/
+eligible/selected`，并断言每条 response 的 selected 数严格等于 `K_i`、mask 无梯度、
+loss 无 NaN/Inf。
+
+**依赖：** Exp #4 Stage 1、Exp #26 Short-OPD baseline、Reward-Top mask 与诊断实现。
+
+**状态：** 未跑；实验设计已确认，训练长度锁定为 70 step。
+
+---
+
+## Exp #33（2026-10-10 新增）— W2 Short-OPD Reward-Top20 low-low replacement
+
+**问题：** Exp #32 按 `|r_t|` 选出的高 reward token 中，是否混入了 teacher 和
+student 都只给极低概率、但相对 log-ratio 很大的 low-low token，从而造成早期停滞、
+梯度噪声或无效学习？本实验只替换 Exp #32 selected set 中的 low-low token，保持
+20% retention 和所有训练配置不变。
+
+**公共配置：** 与 Exp #32 完全一致：Exp #4 W2 Stage 1 起训、thinking on、
+`2048/1024` 短 rollout、sampled reverse-KL、temperature `0.6`、effective batch
+64、8 GPU、warmup 30 + stable 40、共 70 step，保存并评测
+`0/10/20/30/40/50/60/70`。直接 baseline 是 Exp #32 Reward-Top20；Exp #26
+Vanilla 作为第二基线。
+
+**low-low 定义：** low-low 不是 reward 排名后 1%，而是同一个 sampled token 在
+teacher 和 student 下的绝对概率都不超过 1%：
+
+```text
+low_low_t = (p_s <= 0.01) and (p_t <= 0.01)
+```
+
+实现时在 FP32 log-probability 上判断，避免 BF16 `exp` 下溢：
+
+```text
+low_low_t = (logp_s <= log(0.01)) and (logp_t <= log(0.01))
+log(0.01) = -4.605170...
+```
+
+这里的 `logp_s/logp_t` 必须与 Exp #32 的 reward 和 loss 使用相同的 temperature
+`0.6` 口径。
+
+**替换算法（每条 response 独立）：** 先按 Exp #32 得到 `S_i=Reward-Top20`。
+
+```text
+B_i = S_i 中所有 low-low token
+C_i = 未被 S_i 选中、且不是 low-low 的有效 response token
+R_i = C_i 中按 |r_t| 降序的前 |B_i| 个 token
+S'_i = (S_i - B_i) union R_i
+```
+
+最终必须保持 `|S'_i| = |S_i| = K_i`。若 `C_i` 不足，先替换所有可替换项，
+剩余位置保留原 low-low token并记录 `replacement_coverage`，不得缩小 retention。
+replacement 只改变 loss mask；loss 仍使用 token 原始的有符号 `r_t`，不得使用
+`|r_t|`、不得新增权重或裁剪。分母仍是 selected token 总数。
+
+**必须记录：** 继承 Exp #32 全部指标，并额外记录：
+
+- `low_low_all_token_share`：全部 eligible token 中 low-low 占比；
+- `low_low_selected_token_share_before/after`；
+- `low_low_selected_abs_reward_share_before/after`；
+- `replacement_count`、`replacement_coverage`；
+- replacement 前后 selected `|r|`、`p_s`、`p_t` 的均值/P95；
+- low-low 与 replacement token 的 response 相对位置分布。
+
+上述 share 按整个 batch pooled count / reward sum 计算，不要先算每条 response
+百分比再平均。
+
+**评测与判定：** 与 Exp #32 使用完全相同的 checkpoint 和协议。若 Exp #33
+相对 Exp #32 同时满足：① step `30–50` 更早开始提升；②后期 GSM8K/MATH-500
+平均或完整 benchmark 平均至少提高约 1 point；③selected low-low token/reward
+share 明显下降；④keep rate、rollout tokens、LR、batch、grad norm 无混杂变化，
+则支持“W2 sampled OPD 的部分高 reward 实际来自有害 low-low 监督”。若只降低
+grad norm、不提高 benchmark，不能写成能力增益。
+
+**实现闸门与目标命令：** 复用 Exp #32 的统一 token-selection 实现，不另写第二套
+loss。正式运行前 1-step smoke 必须同时保存 replacement 前/后的 mask，并断言
+selected 数不变、最终 selected 中不存在可被替换但未替换的 low-low token。
+
+```bash
+bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --max-length 2048 --response-cap 1024 --max-steps 70 --save-steps 10 \
+  --lr 2e-6 --warmup-steps 30 --warmup-start-lr 2e-7 \
+  --lr-scheduler constant_with_warmup \
+  --opd-token-selection reward_top_low_low_replace \
+  --opd-token-retention 0.20 --opd-low-low-threshold 0.01 \
+  --opd-mask-denominator selected \
+  --run-suffix short2048-rewardtop20-llreplace-s70
+```
+
+**后续扩展条件：** 第一轮只跑这两个新分支。只有 Exp #32 或 #33 相对 Vanilla
+出现稳定正增益，才补 Random20 排除“一般稀疏化”解释，并对正结果补 3 seeds；
+只有 Exp #33 明显优于 Exp #32，才继续测试完整 DIAL score 的 `beta=1/1.2`。
+
+**依赖：** Exp #32 的 Reward-Top20 实现与 checkpoint、同一份 Exp #26 baseline。
+
+**状态：** 未跑；实验设计已确认，训练长度锁定为 70 step。
