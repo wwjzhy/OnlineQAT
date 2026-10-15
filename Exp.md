@@ -2885,3 +2885,165 @@ bash scripts/run_qwen3_1.7b_opd.sh --wbits 2 --stage 2 \
 **依赖：** Exp #32 的 Reward-Top20 实现与 checkpoint、同一份 Exp #26 baseline。
 
 **状态：** 未跑；实验设计已确认，训练长度锁定为 70 step。
+
+---
+
+## Exp #34（2026-10-15 新增）— W2 Short OPD Scale 扰动70步 + 撤扰动续训50步
+
+**来源：** [W2 OPD Scale 扰动实验交接文档](https://chatgpt.com/space/page_a73d3cc501448191a6c361031b68c2cd)，2026-10-15 读取版本。
+本节登记实验设计与实现验收要求；交接文档中的接口名称仍是草案，不表示当前代码已支持。
+
+**问题：** 正常 W2 rollout 上增加 scale 邻域蒸馏，是否改善正常 W2 的
+GSM8K/MATH-500？撤扰动后能否保留收益？主比较为 B100 对 A100、C150 对 A150。
+首轮不叠加 PV gate、mixed OPD、entropy/reward token selection、low-low replacement
+或额外奖励；不验证跨 block 协同、SAM 等价或“跳出局部最优”。
+
+### 分组、起点与日程
+
+| 阶段 | global step | 训练内容 | 恢复与对照 |
+|---|---|---|---|
+| W 共同 warmup | 1–30 | 标准 Vanilla OPD，`2e-7` 线性升至 `2e-6` | 优先复用配置一致的完整 Vanilla checkpoint30 |
+| A 纯 Vanilla | 持续至100/150 | 标准 OPD，warmup后恒定 `2e-6` | 优先复用 #26 / #29 Vanilla 的同step模型与结果 |
+| B 扰动阶段 | 31–100，新增70步 | 正常/扰动 Student 分支各权重0.5，恒定 `2e-6` | 从共同 W30 完整恢复；不能从 Stage1 只训总共70步 |
+| C 撤扰动续训 | 101–150，新增50步 | 关闭扰动，仅正常 Student 分支、权重1，恒定 `2e-6` | **从本轮 B100 完整恢复**，不是从 A100 分叉 |
+
+完整恢复包括模型、量化参数、Adam、scheduler、RNG、Trainer state 和数据进度。
+C 不重置优化器、不重新 warmup，第一步即确认无噪声、无第二 Student 分支。
+必须保留完整 W30、B100、C150。历史 checkpoint 的存在与完整性执行前现场核查；
+若 W30 不满足配置/数据/生成策略一致性，共同重跑 W。
+历史 A 还需通过新旧 clean 代理的梯度与单次更新一致性验收，不能仅凭目录名复用。
+
+### 锁定配置
+
+| 项目 | 配置 |
+|---|---|
+| Student / Stage1 | Exp #4 的 Qwen3-1.7B，W2A16，group128；`output/block_qat/Qwen3-1.7B-w2g128`，执行前核实 |
+| Teacher | 同一冻结 BF16 Qwen3-1.7B，核实模型/tokenizer版本 |
+| 数据 | #26 的 OpenThoughts prompt manifest、顺序与seed；记录实际保留数及hash |
+| 模式与监督 | thinking on，CE=0，gate=1，全部有效 response token；mask继承直接Vanilla基线 |
+| 长度 | `max_length=2048`、response cap1024；每batch预算 `min(1024,2048-padded_prompt_len)` |
+| prompt过滤 | 按生成模板计算 prompt-only 长度，`prompt_length<=2047`；不纳入gold completion，不改成<=1024 |
+| 采样 | temperature0.6；实际 top-k/top-p/logits processors 读取并保存 generation_config，A/B一致 |
+| 资源 | 计划8张同构GPU、effective batch64；现场核实硬件与可用性 |
+| 优化器 | 继承 #26，目标核实 AdamW、betas=(0.9,0.95)、eps=1e-6、grad clip0.5；差异必须登记 |
+| 可训练参数 | 与Vanilla完全一致，不切换scale-only；不训练embedding，冻结zero_point；打印实际trainable名称/分类/数量并核对 |
+
+短长度过滤后的保留数重新统计，不能直接沿用历史8192配置的32,757。
+
+### 临时 scale 扰动
+
+每个 optimizer step 从全部 Transformer block 中不放回随机选择两个，只扰动
+其中已有 W2 线性层量化器的 scale。每个group独立抽取符号：
+
+```text
+delta_g = epsilon * sign_g, sign_g in {-1,+1}
+s_eff_g = s_base_g * exp(delta_g)
+epsilon = 0.01
+```
+
+`s_base` 为原量化器按原规则取得的正数有效scale；用 `s_eff` 重新计算整数code和
+反量化权重，保留原abs/clamp/gradscale/STE、整数范围、zero_point及数值边界。
+不新增可训练参数、不写回scale、不将噪声保存到optimizer或模型。
+rollout、checkpoint导出和所有评测均使用无临时扰动的真实参数。
+
+使用独立噪声RNG，不推进rollout随机流；同一步所有梯度累积microbatch与DDP
+rank使用相同block、符号与seed。噪声须固定覆盖forward/backward和activation
+checkpoint重计算，不能在quantizer.forward中重新抽样。
+正式运行前小batch检查1%扰动的code flip、重构权重变化和行为变化；若完全无效
+或数值异常，先排查实现/幅度并锁定，不在正式训练中根据测试分数扫幅度。
+
+### 目标函数和一次更新
+
+正常 W2 生成同一条 rollout；Teacher仅打分一次。两个Student分支读取相同
+token/prefix。FP32归一化后gather sampled action log-prob，可复用已有分块
+`sampled_action_log_probs`，不能BF16 log-softmax后才转float。
+
+```text
+lp_T     = log p_teacher(a|h)       # detached
+lp_old   = log p_behavior(a|h)      # detached，真实采样分布
+lp_u     = log p_student_u(a|h)     # 有梯度，u为clean或perturbed
+A_u      = sg(lp_T - lp_u)
+r_u      = exp(lp_u - lp_old)       # 保留梯度
+L_u      = -mean_valid_response(r_u * A_u)
+L_B      = 0.5 * L_clean + 0.5 * L_perturbed
+L_C      = L_clean
+```
+
+不额外乘 `lp_u`，不新增PPO clipping、advantage whitening、reward clipping或gate。
+扰动分支计算自己的advantage；两分支mask、全有效response分母和跨rank聚合一致。
+B/C使用同一未裁剪ratio代理；共同W仍使用原Vanilla。
+新旧代理标量loss不要求相等，比较梯度与单次参数更新。
+
+old log-prob优先来自实际rollout；重算时验证参数、模式、温度、logits processors
+和采样路径一致，且中间没有更新。同步clean策略时 `r_clean` 应接近1。
+若采样截断导致支持集不足，不宣称全词表无偏reverse-KL，也不能只改B的采样。
+token级ratio仅校正正常Student访问的固定prefix上的动作分布，不校正完整轨迹占用。
+
+执行顺序：正常rollout → Teacher一次打分 → 正常分支loss/backward → 同参数
+扰动分支loss/backward → 完成有效batch梯度累积 → 原梯度裁剪 → **一次**
+optimizer/scheduler step。沿用Trainer/Accelerate的AMP、DDP no_sync和恢复逻辑；
+优先在现有training_step顺序backward，不长期保留两份图或重复执行父类backward。
+
+### 实现落点与验收
+
+现有入口：`quantize/quantizer.py`、`main_e2e_distill.py` 中的
+`PolicyGKDTrainer`/training_step/日志callback、`scripts/run_qwen3_1.7b_opd.sh`、
+`tests/test_opd_stage2.py`及量化器测试；沿用现有convert/eval/save入口。
+不改变旧实验默认行为、不覆盖 #32/#33。
+接口草案仅包括mode、amplitude、num_blocks，以及明确的ratio代理选项；
+例如 `--opd-scale-perturb`、`--opd-scale-perturb-eps 0.01`、
+`--opd-scale-perturb-blocks 2`，**实现并验收后才填写正式运行命令**。
+
+必须完成：
+
+1. 零噪声量化一致；同一新代理下，零噪声单/双分支loss、梯度、单次更新一致，注明dtype容差。
+2. 新clean代理与旧Vanilla梯度、单次更新一致，且同步时ratio接近1。
+3. 小词表固定prefix、无截断分布，枚举动作验证代理期望梯度与精确reverse-KL一致。
+4. 噪声仅影响两个指定block，真实参数不被直接修改；Teacher/old/advantage/noise无梯度，可训练scale有梯度。
+5. activation checkpoint开/关噪声一致，撤扰动后clean恢复，保存/转换不含临时噪声。
+6. 完整有效batch的1-step smoke：只更新一次、LR正确、mask/分母一致、无NaN/Inf。
+7. 短DDP与保存恢复smoke：rank候选一致、无hang、不重复归一化；恢复step/LR/数据位置正确。
+8. B100→C恢复验收：关闭扰动、仅一个正常分支、保留Adam/scheduler/RNG/数据进度。
+
+1-step与DDP验收通过前不启动正式训练；ratio异常先排查概率口径和量化路径。
+
+### 评测、产出与判定
+
+保存并评测共同起点30；B的40/50/60/70/80/90/100；C的110/120/130/140/150。
+step0优先复用配置核实后的Stage1结果。首轮明确只评 **MATH-500（主）和
+GSM8K（次）**，稳定信号后追加完整benchmark与多种子。
+评测沿用evalscope/vLLM openai_api、thinking on、T0.6、top_k20、max_tokens8192；
+训练2048/1024不等于评测长度。所有组同版本、split、模板、采样次数与seed，
+保留逐题response/正确性/长度及评测EOS/截断率，不混用历史profile分数。
+
+预设主比较B100−A100、C150−A150，另报告C150−B100，以及B末三点80/90/100、
+C末三点130/140/150走势，不按峰值更换终点。主终点逐题配对bootstrap不能替代
+训练seed复现或覆盖全部随机解码波动。B数值失败先修复，不接坏状态继续训C。
+C的提升同时包含额外50步训练，不能单独归因“撤扰动”；若要因果比较撤扰动与
+继续扰动，需另从B100分叉，本轮不增加。单种子两任务只作筛选。
+
+每步记录global/阶段step、LR、clean/perturbed surrogate loss、sampled log-ratio、
+ratio分位数/最大值、有效token数、grad norm、真实code jump、response长度、EOS/
+截断率、累计rollout tokens、rollout/Teacher/Student/总step时间；另记录epsilon、
+选中block、噪声seed、受扰动group数、临时perturbation code-flip和权重相对变化。
+**临时clean-vs-perturbed code flip与真实参数更新前后的code jump分开记录和绘图。**
+
+保存resolved config、commit/dirty diff、模型hash、数据manifest/hash、生成/评测配置、
+trainable范围、完整checkpoint和raw JSONL；合并timeline，绘制分数、长度/截断、
+grad norm、code jump和时间曲线。共同warmup、B、C、B+C与Vanilla分别报墙钟/
+GPU时间、吞吐；同更新数不代表同计算预算，效率按实测GPU时间比较。
+运行tag和输出目录使用独立名称，实施后回填实际路径，不覆盖历史产物。
+
+| 阶段 | global step | MATH-500 | GSM8K | 评测截断率 | 训练GPU时间 | 累计rollout tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| W共同起点 | 30 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| A纯Vanilla | 100 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| B扰动终点 | 100 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| A纯Vanilla | 150 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| C从B100撤扰动续训 | 150 | 待填 | 待填 | 待填 | 待填 | 待填 |
+
+**依赖：** Exp #4 Stage1、#26/#29 Vanilla配置与完整W30、scale临时扰动与ratio
+代理实现、双分支及保存恢复验收、完整B100。远端配置、checkpoint和GPU未核查。
+
+**状态：** 已登记设计；待实现、待验收、未启动训练，无新结果。
+本次仅更新Exp；正式B/C恢复命令、输出路径和测试结果由实现后回填。
